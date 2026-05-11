@@ -1,0 +1,26 @@
+services:
+  idle-steam:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: idle-steam
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    env_file: .env
+    environment:
+      DATABASE_PATH: /app/data/idle-steam.sqlite
+      NODE_OPTIONS: --disable-warning=ExperimentalWarning
+    volumes:
+      - ./data:/app/data:rw
+    networks:
+      - main-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  main-network:
+    external: true
+    name: main-gateway
