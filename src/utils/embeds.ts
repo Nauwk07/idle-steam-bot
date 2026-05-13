@@ -11,6 +11,14 @@ const TYPE_COLORS = {
 
 export type EmbedType = keyof typeof TYPE_COLORS;
 
+/** Version sans client Discord — pour les DMs et les notifications sans branding. */
+export function buildEmbed(type: EmbedType, description: string): EmbedBuilder {
+  return new EmbedBuilder()
+    .setColor(TYPE_COLORS[type])
+    .setDescription(description)
+    .setTimestamp();
+}
+
 export function responseEmbed(
   client: Client,
   type: EmbedType,

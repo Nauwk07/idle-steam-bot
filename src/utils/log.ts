@@ -1,19 +1,11 @@
 import type { ChatInputCommandInteraction } from "discord.js";
-
-import type { EventLogRepository } from "../db/repositories";
 import type { AppLogger } from "../logger";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 export type BotLog = (level: LogLevel, message: string, meta?: unknown) => void;
 
-export function createBotLog(
-  events: EventLogRepository,
-  logger: AppLogger,
-): BotLog {
+export function createBotLog(logger: AppLogger): BotLog {
   return (level, message, meta) => {
-    if (level !== "debug") {
-      events.add(level, message, meta);
-    }
     logger[level]({ meta }, message);
   };
 }

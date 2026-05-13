@@ -1,178 +1,197 @@
-import type { DatabaseConnection } from "./database";
+import { and, desc, eq, sql } from "drizzle-orm";
+import { getDb, schema } from "./index";
+import type {
+  GuildConfig,
+  NewUserAccount,
+  UserAccount,
+  UserEvent,
+  UserGame,
+} from "./schema";
 
-export type GameRecord = {
-  appId: number;
-  name: string | null;
-  enabled: boolean;
-  addedAt: string;
-  updatedAt: string;
-};
+// ─── GuildConfigRepository ────────────────────────────────────
 
-export type IdleEventRecord = {
-  id: number;
-  level: string;
-  message: string;
-  meta: string | null;
-  createdAt: string;
-};
-
-type GameRow = {
-  app_id: number;
-  name: string | null;
-  enabled: number;
-  added_at: string;
-  updated_at: string;
-};
-
-type IdleEventRow = {
-  id: number;
-  level: string;
-  message: string;
-  meta: string | null;
-  created_at: string;
-};
-
-const DEFAULT_SETTINGS = {
-  auto_restart: "true",
-  dry_run: "false",
-  standby: "false",
-};
-
-export class GamesRepository {
-  constructor(private readonly db: DatabaseConnection) {}
-
-  upsert(appId: number, name?: string) {
-    const now = new Date().toISOString();
-    this.db
-      .prepare(
-        `
-        INSERT INTO games (app_id, name, enabled, added_at, updated_at)
-        VALUES (?, ?, 1, ?, ?)
-        ON CONFLICT(app_id) DO UPDATE SET
-          name = COALESCE(excluded.name, games.name),
-          enabled = 1,
-          updated_at = excluded.updated_at
-      `,
-      )
-      .run(appId, name || null, now, now);
+export class GuildConfigRepository {
+  async get(guildId: string): Promise<GuildConfig | null> {
+    const db = getDb();
+    const [row] = await db
+      .select()
+      .from(schema.guildConfig)
+      .where(eq(schema.guildConfig.guildId, guildId));
+    return row ?? null;
   }
 
-  remove(appId: number) {
-    const result = this.db.prepare("DELETE FROM games WHERE app_id = ?").run(appId);
-    if (Number(result.changes) === 0) {
-      throw new Error(`Jeu introuvable: ${appId}`);
-    }
+  async setAllowedRole(guildId: string, roleId: string | null) {
+    const db = getDb();
+    await db
+      .insert(schema.guildConfig)
+      .values({ guildId, allowedRoleId: roleId, updatedAt: new Date() })
+      .onConflictDoUpdate({
+        target: schema.guildConfig.guildId,
+        set: { allowedRoleId: roleId, updatedAt: new Date() },
+      });
   }
 
-  updateName(appId: number, name: string) {
-    this.db
-      .prepare("UPDATE games SET name = ?, updated_at = ? WHERE app_id = ?")
-      .run(name, new Date().toISOString(), appId);
-  }
-
-  list(includeDisabled = true): GameRecord[] {
-    const where = includeDisabled ? "" : "WHERE enabled = 1";
-    const rows = this.db
-      .prepare(`SELECT * FROM games ${where} ORDER BY enabled DESC, app_id ASC`)
-      .all() as GameRow[];
-    return rows.map(mapGame);
-  }
-
-  enabledAppIds(): number[] {
-    return this.list(false).map((game) => game.appId);
-  }
-
-  countEnabled(): number {
-    const row = this.db
-      .prepare("SELECT COUNT(*) AS count FROM games WHERE enabled = 1")
-      .get() as { count: number };
-    return row.count;
+  async setLogChannel(guildId: string, channelId: string | null) {
+    const db = getDb();
+    await db
+      .insert(schema.guildConfig)
+      .values({ guildId, logChannelId: channelId, updatedAt: new Date() })
+      .onConflictDoUpdate({
+        target: schema.guildConfig.guildId,
+        set: { logChannelId: channelId, updatedAt: new Date() },
+      });
   }
 }
 
-export class SettingsRepository {
-  constructor(private readonly db: DatabaseConnection) {
-    for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-      this.db
-        .prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)")
-        .run(key, value);
-    }
+// ─── UserAccountRepository ────────────────────────────────────
+
+export class UserAccountRepository {
+  async findById(discordUserId: string): Promise<UserAccount | null> {
+    const db = getDb();
+    const [row] = await db
+      .select()
+      .from(schema.userAccounts)
+      .where(eq(schema.userAccounts.discordUserId, discordUserId));
+    return row ?? null;
   }
 
-  get(key: string, fallback = ""): string {
-    const row = this.db
-      .prepare("SELECT value FROM settings WHERE key = ?")
-      .get(key) as { value: string } | undefined;
-    return row?.value ?? fallback;
+  async upsert(account: NewUserAccount) {
+    const db = getDb();
+    await db
+      .insert(schema.userAccounts)
+      .values({ ...account, updatedAt: new Date() })
+      .onConflictDoUpdate({
+        target: schema.userAccounts.discordUserId,
+        set: {
+          steamUsername: account.steamUsername,
+          encryptedPassword: account.encryptedPassword,
+          encryptionIv: account.encryptionIv,
+          updatedAt: new Date(),
+        },
+      });
   }
 
-  set(key: string, value: string | boolean | number) {
-    this.db
-      .prepare(
-        `
-        INSERT INTO settings (key, value)
-        VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-      `,
-      )
-      .run(key, String(value));
+  async updateSteamGuardStatus(discordUserId: string, hasSteamGuard: boolean) {
+    const db = getDb();
+    await db
+      .update(schema.userAccounts)
+      .set({
+        hasSteamGuard,
+        // Si Steam Guard activé, on force la désactivation de l'auto-restart
+        autoRestartEnabled: hasSteamGuard ? false : undefined,
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.userAccounts.discordUserId, discordUserId));
   }
 
-  getBoolean(key: string, fallback = false): boolean {
-    const value = this.get(key, String(fallback)).toLowerCase();
-    return ["1", "true", "yes", "on"].includes(value);
+  async setAutoRestart(discordUserId: string, enabled: boolean) {
+    const db = getDb();
+    await db
+      .update(schema.userAccounts)
+      .set({ autoRestartEnabled: enabled, updatedAt: new Date() })
+      .where(eq(schema.userAccounts.discordUserId, discordUserId));
   }
 
-  setBoolean(key: string, value: boolean) {
-    this.set(key, value ? "true" : "false");
+  async delete(discordUserId: string) {
+    const db = getDb();
+    await db
+      .delete(schema.userAccounts)
+      .where(eq(schema.userAccounts.discordUserId, discordUserId));
   }
 }
 
-export class EventLogRepository {
-  constructor(private readonly db: DatabaseConnection) {}
+// ─── UserGamesRepository ──────────────────────────────────────
 
-  add(level: string, message: string, meta?: unknown) {
-    this.db
-      .prepare(
-        `
-        INSERT INTO idle_events (level, message, meta, created_at)
-        VALUES (?, ?, ?, ?)
-      `,
+export class UserGamesRepository {
+  async list(discordUserId: string, includeDisabled = true): Promise<UserGame[]> {
+    const db = getDb();
+    const query = db
+      .select()
+      .from(schema.userGames)
+      .where(
+        includeDisabled
+          ? eq(schema.userGames.discordUserId, discordUserId)
+          : and(
+              eq(schema.userGames.discordUserId, discordUserId),
+              eq(schema.userGames.enabled, true),
+            ),
       )
-      .run(
-        level,
-        message,
-        meta === undefined ? null : JSON.stringify(meta),
-        new Date().toISOString(),
+      .orderBy(schema.userGames.appId);
+    return query;
+  }
+
+  async enabledAppIds(discordUserId: string): Promise<number[]> {
+    const games = await this.list(discordUserId, false);
+    return games.map((g) => g.appId);
+  }
+
+  async countEnabled(discordUserId: string): Promise<number> {
+    const db = getDb();
+    const [row] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(schema.userGames)
+      .where(
+        and(
+          eq(schema.userGames.discordUserId, discordUserId),
+          eq(schema.userGames.enabled, true),
+        ),
       );
+    return row?.count ?? 0;
   }
 
-  recent(limit: number): IdleEventRecord[] {
-    const rows = this.db
-      .prepare(
-        `
-        SELECT * FROM idle_events
-        ORDER BY id DESC
-        LIMIT ?
-      `,
-      )
-      .all(Math.max(1, Math.min(limit, 50))) as IdleEventRow[];
-    return rows.map((row) => ({
-      id: row.id,
-      level: row.level,
-      message: row.message,
-      meta: row.meta,
-      createdAt: row.created_at,
-    }));
+  async upsert(discordUserId: string, appId: number, name?: string) {
+    const db = getDb();
+    const now = new Date();
+    await db
+      .insert(schema.userGames)
+      .values({ discordUserId, appId, name: name ?? null, enabled: true, addedAt: now, updatedAt: now })
+      .onConflictDoUpdate({
+        target: [schema.userGames.discordUserId, schema.userGames.appId],
+        set: {
+          name: sql`COALESCE(excluded.name, ${schema.userGames.name})`,
+          enabled: true,
+          updatedAt: now,
+        },
+      });
+  }
+
+  async remove(discordUserId: string, appId: number) {
+    const db = getDb();
+    const result = await db
+      .delete(schema.userGames)
+      .where(
+        and(
+          eq(schema.userGames.discordUserId, discordUserId),
+          eq(schema.userGames.appId, appId),
+        ),
+      );
+    if (result.rowCount === 0) {
+      throw new Error(`Jeu introuvable : \`${appId}\``);
+    }
   }
 }
 
-function mapGame(row: GameRow): GameRecord {
-  return {
-    appId: row.app_id,
-    name: row.name,
-    enabled: row.enabled === 1,
-    addedAt: row.added_at,
-    updatedAt: row.updated_at,
-  };
+// ─── UserEventsRepository ─────────────────────────────────────
+
+export class UserEventsRepository {
+  async add(discordUserId: string, level: string, message: string, meta?: unknown) {
+    const db = getDb();
+    await db.insert(schema.userEvents).values({
+      discordUserId,
+      level,
+      message,
+      meta: meta !== undefined ? meta : null,
+      createdAt: new Date(),
+    });
+  }
+
+  async recent(discordUserId: string, limit: number): Promise<UserEvent[]> {
+    const db = getDb();
+    return db
+      .select()
+      .from(schema.userEvents)
+      .where(eq(schema.userEvents.discordUserId, discordUserId))
+      .orderBy(desc(schema.userEvents.createdAt))
+      .limit(Math.max(1, Math.min(limit, 50)));
+  }
 }

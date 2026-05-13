@@ -5,118 +5,122 @@ import {
 } from "discord.js";
 
 export const commandDefinitions = [
+  // ─── /config ──────────────────────────────────────────────────
   new SlashCommandBuilder()
-    .setName("info")
-    .setDescription("Liste les commandes disponibles."),
+    .setName("config")
+    .setDescription("Configure le bot (réservé au owner Discord du serveur).")
+    .addSubcommand((sub) =>
+      sub
+        .setName("role")
+        .setDescription("Définit le rôle autorisé à utiliser le bot.")
+        .addRoleOption((o) =>
+          o.setName("role").setDescription("Rôle autorisé.").setRequired(true),
+        ),
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("log-channel")
+        .setDescription("Définit le channel de logs du bot.")
+        .addChannelOption((o) =>
+          o.setName("channel").setDescription("Channel texte.").setRequired(true),
+        ),
+    )
+    .addSubcommand((sub) =>
+      sub.setName("status").setDescription("Affiche la configuration actuelle."),
+    ),
 
+  // ─── /account ─────────────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setName("account")
+    .setDescription("Gère ton compte Steam.")
+    .addSubcommand((sub) =>
+      sub.setName("setup").setDescription("Enregistre ou met à jour ton compte Steam (modal privé)."),
+    )
+    .addSubcommand((sub) =>
+      sub.setName("delete").setDescription("Supprime ton compte Steam et arrête l'idle."),
+    )
+    .addSubcommand((sub) =>
+      sub.setName("status").setDescription("Affiche les infos de ton compte."),
+    ),
+
+  // ─── /idle ────────────────────────────────────────────────────
   new SlashCommandBuilder()
     .setName("idle")
-    .setDescription("Pilote l'idle Steam.")
-    .addSubcommand((subcommand) =>
-      subcommand.setName("start").setDescription("Démarre l'idle."),
+    .setDescription("Pilote ton idle Steam.")
+    .addSubcommand((sub) =>
+      sub.setName("start").setDescription("Démarre l'idle."),
     )
-    .addSubcommand((subcommand) =>
-      subcommand.setName("stop").setDescription("Arrête l'idle."),
+    .addSubcommand((sub) =>
+      sub.setName("stop").setDescription("Arrête l'idle."),
     )
-    .addSubcommand((subcommand) =>
-      subcommand.setName("restart").setDescription("Redémarre l'idle."),
+    .addSubcommand((sub) =>
+      sub.setName("restart").setDescription("Redémarre l'idle."),
     )
-    .addSubcommand((subcommand) =>
-      subcommand.setName("status").setDescription("Affiche l'état actuel."),
+    .addSubcommand((sub) =>
+      sub.setName("status").setDescription("Affiche l'état de ta session."),
     )
-    .addSubcommand((subcommand) =>
-      subcommand.setName("doctor").setDescription("Vérifie config, SQLite et Steam."),
-    )
-    .addSubcommand((subcommand) =>
-      subcommand
+    .addSubcommand((sub) =>
+      sub
         .setName("logs")
-        .setDescription("Affiche les derniers logs SQLite.")
-        .addIntegerOption((option: SlashCommandIntegerOption) =>
-          option
+        .setDescription("Affiche tes derniers logs.")
+        .addIntegerOption((o: SlashCommandIntegerOption) =>
+          o
             .setName("limit")
-            .setDescription("Nombre de lignes, max 50.")
+            .setDescription("Nombre de lignes (max 50).")
             .setRequired(false)
             .setMinValue(1)
             .setMaxValue(50),
         ),
     )
-    .addSubcommand((subcommand) =>
-      subcommand
-        .setName("autorestart")
-        .setDescription("Active ou désactive l'auto-restart.")
-        .addBooleanOption((option) =>
-          option
-            .setName("active")
-            .setDescription("Activer l'auto-restart.")
-            .setRequired(true),
-        ),
-    )
-    .addSubcommand((subcommand) =>
-      subcommand
-        .setName("dry-run")
-        .setDescription("Teste Discord/SQLite sans connexion Steam.")
-        .addBooleanOption((option) =>
-          option
-            .setName("active")
-            .setDescription("Activer le mode test.")
-            .setRequired(true),
-        ),
-    )
-    .addSubcommand((subcommand) =>
-      subcommand
+    .addSubcommand((sub) =>
+      sub
         .setName("standby")
         .setDescription("Pause/reprise manuelle de l'idle.")
-        .addBooleanOption((option) =>
-          option
-            .setName("active")
-            .setDescription("Mettre l'idle en pause.")
-            .setRequired(true),
+        .addBooleanOption((o) =>
+          o.setName("active").setDescription("Mettre en pause.").setRequired(true),
+        ),
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("autorestart")
+        .setDescription("Active/désactive l'auto-restart (requiert un compte sans Steam Guard).")
+        .addBooleanOption((o) =>
+          o.setName("active").setDescription("Activer l'auto-restart.").setRequired(true),
         ),
     ),
 
+  // ─── /game ────────────────────────────────────────────────────
   new SlashCommandBuilder()
     .setName("game")
     .setDescription("Gère les jeux à idle.")
-    .addSubcommand((subcommand) =>
-      subcommand
+    .addSubcommand((sub) =>
+      sub
         .setName("add")
         .setDescription("Ajoute un jeu.")
-        .addIntegerOption((option: SlashCommandIntegerOption) =>
-          option
-            .setName("appid")
-            .setDescription("AppID Steam.")
-            .setRequired(true)
-            .setMinValue(1),
+        .addIntegerOption((o: SlashCommandIntegerOption) =>
+          o.setName("appid").setDescription("AppID Steam.").setRequired(true).setMinValue(1),
         )
-        .addStringOption((option: SlashCommandStringOption) =>
-          option
-            .setName("name")
-            .setDescription("Nom lisible optionnel.")
-            .setRequired(false)
-            .setMaxLength(120),
+        .addStringOption((o: SlashCommandStringOption) =>
+          o.setName("name").setDescription("Nom optionnel.").setRequired(false).setMaxLength(120),
         ),
     )
-    .addSubcommand((subcommand) =>
-      subcommand
+    .addSubcommand((sub) =>
+      sub
         .setName("delete")
         .setDescription("Supprime un jeu.")
-        .addIntegerOption((option: SlashCommandIntegerOption) =>
-          option
-            .setName("appid")
-            .setDescription("AppID Steam.")
-            .setRequired(true)
-            .setMinValue(1),
+        .addIntegerOption((o: SlashCommandIntegerOption) =>
+          o.setName("appid").setDescription("AppID Steam.").setRequired(true).setMinValue(1),
         ),
     )
-    .addSubcommand((subcommand) =>
-      subcommand.setName("list").setDescription("Liste les jeux configurés."),
+    .addSubcommand((sub) =>
+      sub.setName("list").setDescription("Liste tes jeux."),
     )
-    .addSubcommand((subcommand) =>
-      subcommand
+    .addSubcommand((sub) =>
+      sub
         .setName("search")
-        .setDescription("Recherche des AppIDs sur le store Steam.")
-        .addStringOption((option: SlashCommandStringOption) =>
-          option
+        .setDescription("Recherche sur le store Steam.")
+        .addStringOption((o: SlashCommandStringOption) =>
+          o
             .setName("query")
             .setDescription("Nom du jeu.")
             .setRequired(true)
@@ -124,4 +128,4 @@ export const commandDefinitions = [
             .setMaxLength(80),
         ),
     ),
-].map((command) => command.toJSON());
+].map((cmd) => cmd.toJSON());

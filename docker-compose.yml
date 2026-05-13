@@ -8,10 +8,7 @@ services:
     user: "${PUID:-1000}:${PGID:-1000}"
     env_file: .env
     environment:
-      DATABASE_PATH: /app/data/idle-steam.sqlite
       NODE_OPTIONS: --disable-warning=ExperimentalWarning
-    volumes:
-      - ./data:/app/data:rw
     networks:
       - main-network
     logging:

@@ -1,63 +1,79 @@
 import { loadConfig } from "./config";
-import { createDiscordClient, DiscordBot, DiscordNotifier } from "./bot/discord";
-import { openDatabase } from "./db/database";
+import { createDiscordClient, DiscordBot } from "./bot/discord";
+import { initDatabase, closeDatabase } from "./db/index";
 import {
-  EventLogRepository,
-  GamesRepository,
-  SettingsRepository,
+  GuildConfigRepository,
+  UserAccountRepository,
+  UserEventsRepository,
+  UserGamesRepository,
 } from "./db/repositories";
 import { createLogger } from "./logger";
-import { SteamIdleService } from "./steam/steamIdleService";
+import { LogChannelService } from "./services/logChannel";
+import { UserIdleManager } from "./services/userIdleManager";
+
+const config = loadConfig();
+const logger = createLogger(config);
+
+process.on("unhandledRejection", (err) => {
+  logger.error({ err }, "Unhandled rejection");
+});
+
+process.on("uncaughtException", (err) => {
+  logger.fatal({ err }, "Uncaught exception — arrêt");
+  process.exit(1);
+});
+
+let shuttingDown = false;
+async function shutdown(signal: string, idleManager: UserIdleManager) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  logger.info({ signal }, "Arrêt demandé, drainage en cours");
+
+  const timeout = setTimeout(() => {
+    logger.warn("Shutdown trop long, exit forcé");
+    process.exit(1);
+  }, 8_000);
+
+  try { await idleManager.stopAll(signal); } catch (err) { logger.warn({ err }, "Erreur stopAll"); }
+  try { await closeDatabase(); } catch (err) { logger.warn({ err }, "Erreur closeDatabase"); }
+
+  clearTimeout(timeout);
+  process.exit(0);
+}
 
 async function main() {
-  const config = loadConfig();
-  const logger = createLogger(config);
-  const db = openDatabase(config.databasePath);
+  initDatabase(config.databaseUrl);
+  logger.info("Base de données connectée");
 
-  const games = new GamesRepository(db);
-  const settings = new SettingsRepository(db);
-  const events = new EventLogRepository(db);
+  const accounts = new UserAccountRepository();
+  const games = new UserGamesRepository();
+  const events = new UserEventsRepository();
+  const guildConfig = new GuildConfigRepository();
+
   const discordClient = createDiscordClient();
-  const notifier = new DiscordNotifier(discordClient, config, logger);
-  const idle = new SteamIdleService(
-    config,
-    games,
-    settings,
-    events,
-    logger,
-    notifier,
-  );
+  const logChannel = new LogChannelService(discordClient, config.discord.guildId, guildConfig, logger);
+  const idleManager = new UserIdleManager(discordClient, config, accounts, games, events, logger);
 
   const bot = new DiscordBot(
     discordClient,
     config,
-    idle,
+    idleManager,
+    accounts,
     games,
-    settings,
     events,
+    guildConfig,
+    logChannel,
     logger,
   );
 
-  process.on("SIGINT", () => shutdown("SIGINT", idle, db, logger));
-  process.on("SIGTERM", () => shutdown("SIGTERM", idle, db, logger));
+  process.on("SIGINT", () => shutdown("SIGINT", idleManager));
+  process.on("SIGTERM", () => shutdown("SIGTERM", idleManager));
 
   await bot.start();
 }
 
-async function shutdown(
-  signal: string,
-  idle: SteamIdleService,
-  db: ReturnType<typeof openDatabase>,
-  logger: ReturnType<typeof createLogger>,
-) {
-  logger.info({ signal }, "Arrêt demandé");
-  await idle.stop(signal);
-  db.close();
-  process.exit(0);
-}
-
-main().catch((error) => {
-  // eslint-disable-next-line no-console
-  console.error(error);
+main().catch((err) => {
+  logger.fatal({ err }, "Impossible de démarrer le bot");
   process.exit(1);
 });
