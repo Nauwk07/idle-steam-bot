@@ -1,9 +1,13 @@
 import {
   ActionRowBuilder,
   ActivityType,
+  ButtonBuilder,
+  ButtonInteraction,
+  ButtonStyle,
   ChannelType,
   ChatInputCommandInteraction,
   Client,
+  ComponentType,
   Events,
   GatewayIntentBits,
   GuildMember,
@@ -31,8 +35,8 @@ import {
 } from "../services/steamStore";
 import { SteamIdleService, type IdleStatus } from "../steam/steamIdleService";
 import { encrypt } from "../utils/encryption";
-import { responseEmbed, panelEmbed, type EmbedType } from "../utils/embeds";
-import { formatBoolean } from "../utils/format";
+import { brandedEmbed, type EmbedType } from "../utils/embeds";
+import { formatBoolean, formatDuration, formatRelativeTimestamp } from "../utils/format";
 import { createBotLog, logCommand, type BotLog } from "../utils/log";
 import { commandDefinitions } from "./commands";
 
@@ -99,11 +103,11 @@ export class DiscordBot {
       const owner = await this.client.users.fetch(this.config.discord.ownerId);
       await owner.send({
         embeds: [
-          panelEmbed(
+          brandedEmbed(
             this.client,
-            "Idle Steam démarré",
-            [`**Bot** : \`${botTag}\``, "Commandes synchronisées."].join("\n"),
             "success",
+            [`**Bot** : \`${botTag}\``, "Commandes synchronisées."].join("\n"),
+            "Idle Steam démarré",
           ),
         ],
       });
@@ -120,6 +124,8 @@ export class DiscordBot {
 
   private async hasAccess(interaction: ChatInputCommandInteraction): Promise<boolean> {
     if (this.isOwner(interaction.user.id)) return true;
+
+    if (interaction.guildId !== this.config.discord.guildId) return false;
 
     const cfg = await this.guildConfig.get(this.config.discord.guildId);
     if (!cfg?.allowedRoleId) return false;
@@ -176,7 +182,7 @@ export class DiscordBot {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error({ error }, "Modal Discord échoué");
       await interaction.reply({
-        embeds: [responseEmbed(this.client, "error", `Erreur : ${message}`)],
+        embeds: [brandedEmbed(this.client, "error", `Erreur : ${message}`)],
         flags: MessageFlags.Ephemeral,
       });
     }
@@ -260,11 +266,18 @@ export class DiscordBot {
         await this.replyEphemeral(interaction, "warn", "Compte Steam", "Aucun compte à supprimer.");
         return;
       }
+
+      const ok = await this.confirm(
+        interaction,
+        "Supprimer ton compte Steam ?",
+        `Tu vas supprimer \`${account.steamUsername}\` et **tous tes jeux**.\nCette action est irréversible.`,
+      );
+      if (!ok) return;
+
       await this.idleManager.destroySession(interaction.user.id);
       await this.accounts.delete(interaction.user.id);
       this.log("info", "Compte Steam supprimé", { userId: interaction.user.id, username: account.steamUsername });
       await this.logChannel.send(`Compte supprimé par <@${interaction.user.id}> (\`${account.steamUsername}\`)`, "warn");
-      await this.replyEphemeral(interaction, "success", "Compte supprimé", `Compte \`${account.steamUsername}\` et tous tes jeux ont été supprimés.`);
     }
   }
 
@@ -330,7 +343,7 @@ export class DiscordBot {
 
     await interaction.reply({
       embeds: [
-        responseEmbed(
+        brandedEmbed(
           this.client,
           "success",
           `Compte \`${steamUsername}\` enregistré.\n- Lance \`/idle start\` pour démarrer l'idle.`,
@@ -435,7 +448,7 @@ export class DiscordBot {
 
     if (interaction.user.id !== userId) {
       await interaction.reply({
-        embeds: [responseEmbed(this.client, "error", "Ce modal ne t'est pas destiné.")],
+        embeds: [brandedEmbed(this.client, "error", "Ce modal ne t'est pas destiné.")],
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -458,21 +471,21 @@ export class DiscordBot {
 
       if (result === "running") {
         await interaction.editReply({
-          embeds: [panelEmbed(this.client, "Idle démarré", await this.formatStatus(userId), "success")],
+          embeds: [brandedEmbed(this.client, "success", await this.formatStatus(userId), "Idle démarré")],
         });
       } else if (result === "steam-guard") {
         await interaction.editReply({
-          embeds: [responseEmbed(this.client, "warn", "Code Steam Guard requis.\n- Relance `/idle start` et saisis le code reçu par email ou l'appli Steam.")],
+          embeds: [brandedEmbed(this.client, "warn", "Code Steam Guard requis.\n- Relance `/idle start` et saisis le code reçu par email ou l'appli Steam.")],
         });
       } else {
         await interaction.editReply({
-          embeds: [responseEmbed(this.client, "error", `Connexion échouée.\n- ${status.lastError ?? "Erreur inconnue."}`)],
+          embeds: [brandedEmbed(this.client, "error", `Connexion échouée.\n- ${status.lastError ?? "Erreur inconnue."}`)],
         });
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await interaction.editReply({
-        embeds: [responseEmbed(this.client, "error", `Erreur.\n- ${message}`)],
+        embeds: [brandedEmbed(this.client, "error", `Erreur.\n- ${message}`)],
       });
     }
   }
@@ -481,35 +494,28 @@ export class DiscordBot {
     service: SteamIdleService,
     timeoutMs = 20_000,
   ): Promise<"running" | "steam-guard" | "error"> {
-    const current = service.getStatus();
-    if (current.phase === "running") return Promise.resolve("running");
-    if (current.phase === "error") return Promise.resolve("error");
-    if (service.hasPendingSteamGuard()) return Promise.resolve("steam-guard");
+    const classify = (): "running" | "steam-guard" | "error" | null => {
+      if (service.hasPendingSteamGuard()) return "steam-guard";
+      const s = service.getStatus();
+      if (s.phase === "running" || s.phase === "standby") return "running";
+      if (s.phase === "error") return "error";
+      return null;
+    };
+
+    const immediate = classify();
+    if (immediate) return Promise.resolve(immediate);
 
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
+      const finish = (result: "running" | "steam-guard" | "error") => {
+        clearTimeout(timer);
         service.off("status", handler);
-        const s = service.getStatus();
-        if (service.hasPendingSteamGuard()) resolve("steam-guard");
-        else if (s.phase === "error") resolve("error");
-        else resolve("running");
-      }, timeoutMs);
+        resolve(result);
+      };
 
+      const timer = setTimeout(() => finish(classify() ?? "running"), timeoutMs);
       const handler = () => {
-        const s = service.getStatus();
-        if (s.phase === "running") {
-          clearTimeout(timer);
-          service.off("status", handler);
-          resolve("running");
-        } else if (s.phase === "error") {
-          clearTimeout(timer);
-          service.off("status", handler);
-          resolve("error");
-        } else if (service.hasPendingSteamGuard()) {
-          clearTimeout(timer);
-          service.off("status", handler);
-          resolve("steam-guard");
-        }
+        const r = classify();
+        if (r) finish(r);
       };
 
       service.on("status", handler);
@@ -542,12 +548,17 @@ export class DiscordBot {
 
     if (sub === "delete") {
       const appId = interaction.options.getInteger("appid", true);
-      await this.games.remove(userId, appId);
 
+      const ok = await this.confirm(
+        interaction,
+        "Supprimer ce jeu ?",
+        `Tu vas retirer l'AppID \`${appId}\` de ta liste d'idle.`,
+      );
+      if (!ok) return;
+
+      await this.games.remove(userId, appId);
       const session = this.idleManager.get(userId);
       if (session) await session.applyGames("game-delete");
-
-      await this.replyEphemeral(interaction, "success", "Jeu supprimé", `- **AppID** : \`${appId}\``);
       return;
     }
 
@@ -568,11 +579,11 @@ export class DiscordBot {
       const results = await searchSteamStore(query);
       await interaction.editReply({
         embeds: [
-          panelEmbed(
+          brandedEmbed(
             this.client,
-            "Recherche Steam",
-            formatSearchResults(query, results),
             results.length > 0 ? "info" : "warn",
+            formatSearchResults(query, results),
+            "Recherche Steam",
           ),
         ],
       });
@@ -590,7 +601,7 @@ export class DiscordBot {
     const phase = status.phase ? translatePhase(status.phase) : "non démarré";
     const gameCount = await this.games.countEnabled(userId);
 
-    const lines = [
+    const lines: string[] = [
       `- **Idle** : ${phase}`,
       `- **Compte** : \`${account.steamUsername}\``,
       `- **Jeux** : \`${gameCount}\``,
@@ -598,10 +609,66 @@ export class DiscordBot {
       `- **Steam Guard** : ${formatBoolean(account.hasSteamGuard)}`,
     ];
 
+    if (status.startedAt && (status.phase === "running" || status.phase === "standby")) {
+      const uptime = Date.now() - new Date(status.startedAt).getTime();
+      if (uptime > 0) lines.push(`- **Uptime** : ${formatDuration(uptime)}`);
+    }
+    if (status.nextRestartAt && status.phase === "restarting") {
+      lines.push(`- **Prochain restart** : ${formatRelativeTimestamp(status.nextRestartAt)}`);
+    }
     if (status.standbyReason) lines.push(`- **Standby** : ${status.standbyReason}`);
     if (status.lastError) lines.push(`- **Erreur** : ${status.lastError}`);
 
     return lines.join("\n");
+  }
+
+  private async confirm(
+    interaction: ChatInputCommandInteraction,
+    title: string,
+    description: string,
+  ): Promise<boolean> {
+    const yes = new ButtonBuilder()
+      .setCustomId("confirm:yes")
+      .setStyle(ButtonStyle.Danger)
+      .setLabel("Confirmer");
+    const no = new ButtonBuilder()
+      .setCustomId("confirm:no")
+      .setStyle(ButtonStyle.Secondary)
+      .setLabel("Annuler");
+
+    const reply = await interaction.reply({
+      embeds: [brandedEmbed(this.client, "warn", description, title)],
+      components: [new ActionRowBuilder<ButtonBuilder>().addComponents(yes, no)],
+      flags: MessageFlags.Ephemeral,
+      withResponse: true,
+    });
+
+    try {
+      const press = await reply.resource!.message!.awaitMessageComponent({
+        componentType: ComponentType.Button,
+        filter: (i: ButtonInteraction) => i.user.id === interaction.user.id,
+        time: 30_000,
+      });
+      const confirmed = press.customId === "confirm:yes";
+      await press.update({
+        embeds: [
+          brandedEmbed(
+            this.client,
+            confirmed ? "success" : "info",
+            confirmed ? "Action confirmée." : "Action annulée.",
+            title,
+          ),
+        ],
+        components: [],
+      });
+      return confirmed;
+    } catch {
+      await interaction.editReply({
+        embeds: [brandedEmbed(this.client, "info", "Confirmation expirée, action annulée.", title)],
+        components: [],
+      });
+      return false;
+    }
   }
 
   private async replyEphemeral(
@@ -610,7 +677,7 @@ export class DiscordBot {
     title: string,
     description: string,
   ) {
-    const embed = panelEmbed(this.client, title, description.slice(0, 3900), type);
+    const embed = brandedEmbed(this.client, type, description, title);
 
     if (interaction.deferred || interaction.replied) {
       await interaction.editReply({ embeds: [embed] });

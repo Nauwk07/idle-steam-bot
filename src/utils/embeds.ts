@@ -11,38 +11,35 @@ const TYPE_COLORS = {
 
 export type EmbedType = keyof typeof TYPE_COLORS;
 
-/** Version sans client Discord — pour les DMs et les notifications sans branding. */
-export function buildEmbed(type: EmbedType, description: string): EmbedBuilder {
-  return new EmbedBuilder()
+type EmbedOptions = {
+  title?: string;
+  branded?: boolean;
+  client?: Client;
+};
+
+export function buildEmbed(
+  type: EmbedType,
+  description: string,
+  options: EmbedOptions = {},
+): EmbedBuilder {
+  const embed = new EmbedBuilder()
     .setColor(TYPE_COLORS[type])
-    .setDescription(description)
+    .setDescription(description.slice(0, 4000))
     .setTimestamp();
+
+  if (options.title) embed.setTitle(options.title);
+  if (options.branded && options.client) applyBotBranding(options.client, embed);
+
+  return embed;
 }
 
-export function responseEmbed(
+export function brandedEmbed(
   client: Client,
   type: EmbedType,
   description: string,
   title?: string,
 ) {
-  const embed = new EmbedBuilder()
-    .setColor(TYPE_COLORS[type])
-    .setDescription(description)
-    .setTimestamp();
-
-  if (title) embed.setTitle(title);
-  applyBotBranding(client, embed);
-
-  return embed;
-}
-
-export function panelEmbed(
-  client: Client,
-  title: string,
-  description: string,
-  type: EmbedType = "info",
-) {
-  return responseEmbed(client, type, description, title);
+  return buildEmbed(type, description, { title, branded: true, client });
 }
 
 export function applyBotBranding(client: Client, embed: EmbedBuilder) {

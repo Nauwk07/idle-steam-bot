@@ -20,7 +20,7 @@ export class LogChannelService {
       const channel = await this.client.channels.fetch(config.logChannelId);
       if (!channel?.isTextBased()) return;
 
-      await (channel as TextChannel).send({ embeds: [buildEmbed(type, message)] });
+      await (channel as TextChannel).send({ embeds: [buildEmbed(type, message)] }); // logs admin sans branding
     } catch (err) {
       this.logger.warn({ err }, "LogChannelService: envoi échoué");
     }

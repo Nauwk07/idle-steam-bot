@@ -6,6 +6,12 @@ import type { AppConfig } from "../config";
 import type { UserAccountRepository, UserEventsRepository, UserGamesRepository } from "../db/repositories";
 import type { AppLogger } from "../logger";
 import type { Notifier } from "../services/notifier";
+import { RATE_LIMIT_BACKOFF_MS, reconnectDelayMs } from "./reconnectStrategy";
+import {
+  describeEResult,
+  isRealSessionTakeover,
+  isUnrecoverableLoginError,
+} from "./steamErrors";
 
 export type IdlePhase =
   | "stopped"
@@ -42,7 +48,6 @@ type SteamCredentials = {
 };
 
 const STEAM_GUARD_TIMEOUT_MS = 5 * 60 * 1000;
-const STEAM_RATE_LIMIT_BACKOFF_MS = 60 * 60 * 1000;
 
 export class SteamIdleService extends EventEmitter {
   private client: SteamUser | null = null;
@@ -62,6 +67,7 @@ export class SteamIdleService extends EventEmitter {
   // Mis à jour à chaque connexion depuis la DB au moment de l'instanciation
   private hasSteamGuard: boolean;
   private autoRestartEnabled: boolean;
+  private transitionLock: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly discordUserId: string,
@@ -101,7 +107,38 @@ export class SteamIdleService extends EventEmitter {
     return this.pendingSteamGuard !== null;
   }
 
-  async start(reason = "manual", steamGuardCode?: string) {
+  /** Sérialise start/stop/restart pour éviter les races sur this.client. */
+  private async runExclusive<T>(label: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.transitionLock;
+    let release!: () => void;
+    this.transitionLock = new Promise<void>((res) => (release = res));
+    try {
+      await previous;
+      return await fn();
+    } finally {
+      this.logger.debug({ discordUserId: this.discordUserId, label }, "Transition terminée");
+      release();
+    }
+  }
+
+  start(reason = "manual", steamGuardCode?: string) {
+    return this.runExclusive("start", () => this.startInternal(reason, steamGuardCode));
+  }
+
+  stop(reason = "manual") {
+    return this.runExclusive("stop", () => this.stopInternal(reason));
+  }
+
+  restart(reason = "manual", steamGuardCode?: string) {
+    return this.runExclusive("restart", async () => {
+      await this.stopInternal(`restart:${reason}`);
+      this.desiredRunning = true;
+      this.intentionalStop = false;
+      await this.startInternal(reason, steamGuardCode);
+    });
+  }
+
+  private async startInternal(reason = "manual", steamGuardCode?: string) {
     this.clearRestartTimer();
     this.desiredRunning = true;
     this.intentionalStop = false;
@@ -145,7 +182,7 @@ export class SteamIdleService extends EventEmitter {
     });
   }
 
-  async stop(reason = "manual") {
+  private async stopInternal(reason = "manual") {
     this.desiredRunning = false;
     this.intentionalStop = true;
     this.clearRestartTimer();
@@ -165,13 +202,6 @@ export class SteamIdleService extends EventEmitter {
     this.phase = "stopped";
     this.log("info", "Idle arrêté", { reason });
     this.emit("status");
-  }
-
-  async restart(reason = "manual", steamGuardCode?: string) {
-    await this.stop(`restart:${reason}`);
-    this.desiredRunning = true;
-    this.intentionalStop = false;
-    await this.start(reason, steamGuardCode);
   }
 
   async applyGames(reason = "games-updated") {
@@ -307,7 +337,6 @@ export class SteamIdleService extends EventEmitter {
     client.on("disconnected", (eresult, message) => {
       if (client !== this.client) return;
 
-      const reason = message || SteamUser.EResult[eresult] || String(eresult);
       this.client = null;
       this.connected = false;
       this.clearSteamGuardRequest();
@@ -318,6 +347,12 @@ export class SteamIdleService extends EventEmitter {
         return;
       }
 
+      if (isRealSessionTakeover(eresult, message)) {
+        this.stopForRealPlay({ eresult, message });
+        return;
+      }
+
+      const reason = describeEResult(eresult, message);
       this.lastError = `Déconnexion Steam: ${reason}`;
       this.log("warn", this.lastError, { eresult, message });
       this.scheduleRestart(this.lastError);
@@ -329,13 +364,19 @@ export class SteamIdleService extends EventEmitter {
       this.client = null;
       this.connected = false;
       this.clearSteamGuardRequest();
+
+      if (isRealSessionTakeover(error.eresult, error.message)) {
+        this.stopForRealPlay({ eresult: error.eresult, message: error.message });
+        return;
+      }
+
       this.lastError = error.message;
       this.log("error", "Erreur Steam", {
         message: error.message,
         eresult: error.eresult,
       });
 
-      if (this.isUnrecoverableLoginError(error.eresult)) {
+      if (isUnrecoverableLoginError(error.eresult)) {
         this.handleUnrecoverableSteamError(
           `Erreur Steam non récupérable: ${error.message}`,
           { message: error.message, eresult: error.eresult },
@@ -399,7 +440,7 @@ export class SteamIdleService extends EventEmitter {
 
     this.phase = "restarting";
     this.reconnectAttempt += 1;
-    const delayMs = this.restartDelayMs(this.reconnectAttempt);
+    const delayMs = reconnectDelayMs(this.reconnectAttempt);
     this.nextRestartAt = new Date(Date.now() + delayMs);
     this.emit("status");
 
@@ -415,7 +456,7 @@ export class SteamIdleService extends EventEmitter {
       this.restartTimer = null;
       this.client = null;
       this.connected = false;
-      this.start("auto-restart").catch((error: unknown) => {
+      this.startInternal("auto-restart").catch((error: unknown) => {
         this.handleFatal("Auto-restart échoué", error);
       });
     }, delayMs);
@@ -424,7 +465,7 @@ export class SteamIdleService extends EventEmitter {
   private scheduleRateLimitBackoff(reason: string) {
     this.phase = "restarting";
     this.reconnectAttempt += 1;
-    this.nextRestartAt = new Date(Date.now() + STEAM_RATE_LIMIT_BACKOFF_MS);
+    this.nextRestartAt = new Date(Date.now() + RATE_LIMIT_BACKOFF_MS);
     this.emit("status");
 
     this.notify(
@@ -439,15 +480,10 @@ export class SteamIdleService extends EventEmitter {
       this.restartTimer = null;
       this.client = null;
       this.connected = false;
-      this.start("rate-limit-backoff").catch((error: unknown) => {
+      this.startInternal("rate-limit-backoff").catch((error: unknown) => {
         this.handleFatal("Relance après rate-limit échouée", error);
       });
-    }, STEAM_RATE_LIMIT_BACKOFF_MS);
-  }
-
-  private restartDelayMs(attempt: number) {
-    const seconds = [10, 30, 60, 300][Math.min(attempt - 1, 3)] ?? 900;
-    return seconds * 1000;
+    }, RATE_LIMIT_BACKOFF_MS);
   }
 
   private isDryRun() {
@@ -505,6 +541,29 @@ export class SteamIdleService extends EventEmitter {
     this.scheduleRestart(this.lastError);
   }
 
+  private stopForRealPlay(meta: unknown) {
+    this.clearRestartTimer();
+    this.clearResumeTimer();
+    this.desiredRunning = false;
+    this.intentionalStop = true;
+    this.phase = "stopped";
+    this.lastError = null;
+    this.standbyReason = null;
+    this.realPlayingAppId = null;
+    this.nextRestartAt = null;
+    this.reconnectAttempt = 0;
+    this.emit("status");
+
+    this.log("info", "Idle arrêté — jeu lancé pour de vrai", meta);
+    this.notify(
+      "Steam a repris la main sur ton compte (jeu lancé ou client ouvert ailleurs).\n\nRelance `/idle start` quand tu as fini.",
+      "success",
+      "🎮 Tu joues pour de vrai",
+    ).catch((error: unknown) =>
+      this.logger.warn({ error }, "Notification arrêt jeu réel échouée"),
+    );
+  }
+
   private handleUnrecoverableSteamError(message: string, meta?: unknown) {
     this.clearRestartTimer();
     this.clearSteamGuardRequest();
@@ -522,23 +581,16 @@ export class SteamIdleService extends EventEmitter {
     );
   }
 
-  private isUnrecoverableLoginError(eresult?: SteamUser.EResult) {
-    return (
-      eresult === SteamUser.EResult.InvalidLoginAuthCode ||
-      eresult === SteamUser.EResult.TwoFactorCodeMismatch ||
-      eresult === SteamUser.EResult.ExpiredLoginAuthCode ||
-      eresult === SteamUser.EResult.TimeNotSynced ||
-      eresult === SteamUser.EResult.InvalidPassword ||
-      eresult === SteamUser.EResult.AccountLoginDeniedNeedTwoFactor
-    );
-  }
-
   private log(level: "info" | "warn" | "error", message: string, meta?: unknown) {
     this.events.add(this.discordUserId, level, message, meta).catch(() => {});
     this.logger[level]({ discordUserId: this.discordUserId, meta }, message);
   }
 
-  private async notify(message: string, type?: Parameters<Notifier["send"]>[1]) {
-    await this.notifier.send(message, type);
+  private async notify(
+    message: string,
+    type?: Parameters<Notifier["send"]>[1],
+    title?: Parameters<Notifier["send"]>[2],
+  ) {
+    await this.notifier.send(message, type, title);
   }
 }

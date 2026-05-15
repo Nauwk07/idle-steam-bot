@@ -3,7 +3,7 @@ import type { EmbedType } from "../utils/embeds";
 import { buildEmbed } from "../utils/embeds";
 
 export type Notifier = {
-  send(message: string, type?: EmbedType): Promise<void>;
+  send(message: string, type?: EmbedType, title?: string): Promise<void>;
 };
 
 export const noopNotifier: Notifier = {
@@ -18,10 +18,10 @@ export class UserDMNotifier implements Notifier {
     private readonly discordUserId: string,
   ) {}
 
-  async send(message: string, type: EmbedType = "info") {
+  async send(message: string, type: EmbedType = "info", title?: string) {
     try {
       const user = await this.client.users.fetch(this.discordUserId);
-      await user.send({ embeds: [buildEmbed(type, message)] });
+      await user.send({ embeds: [buildEmbed(type, message, { title })] });
     } catch {
       // DM désactivés ou user introuvable — on absorbe silencieusement
     }

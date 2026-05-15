@@ -20,3 +20,9 @@ export function formatBoolean(value: boolean): string {
 export function formatDate(value: string | null): string {
   return value ? new Date(value).toLocaleString("fr-FR") : "n/a";
 }
+
+export function formatRelativeTimestamp(value: string | Date | null): string {
+  if (!value) return "n/a";
+  const seconds = Math.floor(new Date(value).getTime() / 1000);
+  return `<t:${seconds}:R>`;
+}

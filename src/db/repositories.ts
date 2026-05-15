@@ -8,6 +8,10 @@ import type {
   UserGame,
 } from "./schema";
 
+function isUniqueViolation(err: unknown): boolean {
+  return typeof err === "object" && err !== null && "code" in err && (err as { code?: string }).code === "23505";
+}
+
 // ─── GuildConfigRepository ────────────────────────────────────
 
 export class GuildConfigRepository {
@@ -57,18 +61,31 @@ export class UserAccountRepository {
 
   async upsert(account: NewUserAccount) {
     const db = getDb();
-    await db
-      .insert(schema.userAccounts)
-      .values({ ...account, updatedAt: new Date() })
-      .onConflictDoUpdate({
-        target: schema.userAccounts.discordUserId,
-        set: {
-          steamUsername: account.steamUsername,
-          encryptedPassword: account.encryptedPassword,
-          encryptionIv: account.encryptionIv,
-          updatedAt: new Date(),
-        },
-      });
+    const now = new Date();
+    try {
+      await db
+        .insert(schema.userAccounts)
+        .values({ ...account, updatedAt: now })
+        .onConflictDoUpdate({
+          target: schema.userAccounts.discordUserId,
+          set: {
+            steamUsername: account.steamUsername,
+            encryptedPassword: account.encryptedPassword,
+            encryptionIv: account.encryptionIv,
+            // Reset à false : la prochaine connexion remettra le bon flag
+            hasSteamGuard: false,
+            autoRestartEnabled: false,
+            updatedAt: now,
+          },
+        });
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        throw new Error(
+          `Le compte Steam \`${account.steamUsername}\` est déjà enregistré par un autre utilisateur.`,
+        );
+      }
+      throw err;
+    }
   }
 
   async updateSteamGuardStatus(discordUserId: string, hasSteamGuard: boolean) {

@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "idx_user_accounts_steam_username" ON "user_accounts" USING btree ("steam_username");

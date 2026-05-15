@@ -29,7 +29,7 @@ export function createLogger(config: AppConfig) {
     level: config.logLevel,
     base: undefined,
     timestamp: pino.stdTimeFunctions.isoTime,
-    serializers: { err: sanitizeErr },
+    serializers: { err: sanitizeErr, error: sanitizeErr },
     ...(isDev && {
       transport: { target: "pino-pretty", options: { colorize: true } },
     }),

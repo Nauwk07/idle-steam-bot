@@ -26,19 +26,23 @@ export type NewGuildConfig = InferInsertModel<typeof guildConfig>;
 
 // ─── User accounts ────────────────────────────────────────────
 // Un compte Steam par utilisateur Discord. Max 1.
-export const userAccounts = pgTable("user_accounts", {
-  discordUserId: varchar("discord_user_id", { length: 20 }).primaryKey(),
-  guildId: varchar("guild_id", { length: 20 }).notNull(),
-  steamUsername: varchar("steam_username", { length: 100 }).notNull(),
-  encryptedPassword: text("encrypted_password").notNull(),
-  encryptionIv: varchar("encryption_iv", { length: 64 }).notNull(),
-  // Mis à jour à chaque connexion : true si Steam Guard a été demandé lors du dernier login
-  hasSteamGuard: boolean("has_steam_guard").notNull().default(false),
-  // Activable uniquement si hasSteamGuard = false
-  autoRestartEnabled: boolean("auto_restart_enabled").notNull().default(false),
-  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
-});
+export const userAccounts = pgTable(
+  "user_accounts",
+  {
+    discordUserId: varchar("discord_user_id", { length: 20 }).primaryKey(),
+    guildId: varchar("guild_id", { length: 20 }).notNull(),
+    steamUsername: varchar("steam_username", { length: 100 }).notNull(),
+    encryptedPassword: text("encrypted_password").notNull(),
+    encryptionIv: varchar("encryption_iv", { length: 64 }).notNull(),
+    // Mis à jour à chaque connexion : true si Steam Guard a été demandé lors du dernier login
+    hasSteamGuard: boolean("has_steam_guard").notNull().default(false),
+    // Activable uniquement si hasSteamGuard = false
+    autoRestartEnabled: boolean("auto_restart_enabled").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [uniqueIndex("idx_user_accounts_steam_username").on(t.steamUsername)],
+);
 
 export type UserAccount = InferSelectModel<typeof userAccounts>;
 export type NewUserAccount = InferInsertModel<typeof userAccounts>;
