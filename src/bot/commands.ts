@@ -79,14 +79,6 @@ export const commandDefinitions = [
         .addBooleanOption((o) =>
           o.setName("active").setDescription("Mettre en pause.").setRequired(true),
         ),
-    )
-    .addSubcommand((sub) =>
-      sub
-        .setName("autorestart")
-        .setDescription("Active/désactive l'auto-restart (requiert un compte sans Steam Guard).")
-        .addBooleanOption((o) =>
-          o.setName("active").setDescription("Activer l'auto-restart.").setRequired(true),
-        ),
     ),
 
   // ─── /game ────────────────────────────────────────────────────
@@ -126,6 +118,27 @@ export const commandDefinitions = [
             .setRequired(true)
             .setMinLength(2)
             .setMaxLength(80),
+        ),
+    ),
+
+  // ─── /audit ───────────────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setName("audit")
+    .setDescription("Trace des actions Discord (owner uniquement).")
+    .addSubcommand((sub) =>
+      sub
+        .setName("list")
+        .setDescription("Affiche les dernières actions sensibles.")
+        .addIntegerOption((o: SlashCommandIntegerOption) =>
+          o
+            .setName("limit")
+            .setDescription("Nombre de lignes (max 50).")
+            .setRequired(false)
+            .setMinValue(1)
+            .setMaxValue(50),
+        )
+        .addUserOption((o) =>
+          o.setName("user").setDescription("Filtrer par utilisateur.").setRequired(false),
         ),
     ),
 ].map((cmd) => cmd.toJSON());

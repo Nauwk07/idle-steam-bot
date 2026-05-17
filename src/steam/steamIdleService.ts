@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import SteamUser from "steam-user";
 
 import type { AppConfig } from "../config";
-import type { UserAccountRepository, UserEventsRepository, UserGamesRepository } from "../db/repositories";
+import type { UserEventsRepository, UserGamesRepository } from "../db/repositories";
 import type { AppLogger } from "../logger";
 import type { Notifier } from "../services/notifier";
 import { RATE_LIMIT_BACKOFF_MS, reconnectDelayMs } from "./reconnectStrategy";
@@ -32,8 +32,6 @@ export type IdleStatus = {
   nextRestartAt: string | null;
   startedAt: string | null;
   lastError: string | null;
-  hasSteamGuard: boolean;
-  autoRestartEnabled: boolean;
 };
 
 type SteamGuardRequest = {
@@ -64,9 +62,6 @@ export class SteamIdleService extends EventEmitter {
   private startedAt: Date | null = null;
   private lastError: string | null = null;
   private intentionalStop = false;
-  // Mis à jour à chaque connexion depuis la DB au moment de l'instanciation
-  private hasSteamGuard: boolean;
-  private autoRestartEnabled: boolean;
   private transitionLock: Promise<void> = Promise.resolve();
 
   constructor(
@@ -74,16 +69,11 @@ export class SteamIdleService extends EventEmitter {
     private readonly credentials: SteamCredentials,
     private readonly config: AppConfig,
     private readonly games: UserGamesRepository,
-    private readonly accounts: UserAccountRepository,
     private readonly events: UserEventsRepository,
     private readonly logger: AppLogger,
     private readonly notifier: Notifier,
-    initialHasSteamGuard = false,
-    initialAutoRestart = false,
   ) {
     super();
-    this.hasSteamGuard = initialHasSteamGuard;
-    this.autoRestartEnabled = initialAutoRestart;
   }
 
   getStatus(): IdleStatus {
@@ -98,8 +88,6 @@ export class SteamIdleService extends EventEmitter {
       nextRestartAt: this.nextRestartAt?.toISOString() ?? null,
       startedAt: this.startedAt?.toISOString() ?? null,
       lastError: this.lastError,
-      hasSteamGuard: this.hasSteamGuard,
-      autoRestartEnabled: this.autoRestartEnabled,
     };
   }
 
@@ -251,17 +239,7 @@ export class SteamIdleService extends EventEmitter {
     this.log("info", "Code Steam Guard transmis");
   }
 
-  setAutoRestart(enabled: boolean) {
-    if (enabled && this.hasSteamGuard) {
-      throw new Error("Impossible d'activer l'auto-restart.\n- Ce compte a le Steam Guard activé, l'auto-restart nécessite une connexion sans code.");
-    }
-    this.autoRestartEnabled = enabled;
-  }
-
   private bindClient(client: SteamUser) {
-    // Suit si steamGuard a été demandé pendant ce login — pour mettre à jour has_steam_guard
-    let steamGuardFiredThisLogin = false;
-
     client.on("loggedOn", () => {
       if (client !== this.client) return;
 
@@ -274,17 +252,6 @@ export class SteamIdleService extends EventEmitter {
       client.setPersona(SteamUser.EPersonaState.Online);
       this.log("info", "Connecté à Steam");
 
-      // Mise à jour du flag Steam Guard en DB selon ce login
-      const hadSteamGuard = steamGuardFiredThisLogin;
-      steamGuardFiredThisLogin = false;
-      this.hasSteamGuard = hadSteamGuard;
-      if (hadSteamGuard) {
-        this.autoRestartEnabled = false;
-      }
-      this.accounts
-        .updateSteamGuardStatus(this.discordUserId, hadSteamGuard)
-        .catch((err: unknown) => this.logger.warn({ err }, "Mise à jour Steam Guard échouée"));
-
       this.applyGames("logged-on").catch((error: unknown) => {
         this.handleFatal("Impossible d'appliquer les jeux", error);
       });
@@ -295,7 +262,6 @@ export class SteamIdleService extends EventEmitter {
     client.on("steamGuard", (domain, callback, lastCodeWrong) => {
       if (client !== this.client) return;
 
-      steamGuardFiredThisLogin = true;
       this.setSteamGuardRequest(callback, { domain, lastCodeWrong });
       this.phase = "starting";
       this.log("warn", "Code Steam Guard requis", { domain, lastCodeWrong });
@@ -426,15 +392,9 @@ export class SteamIdleService extends EventEmitter {
   }
 
   private scheduleRestart(reason: string) {
-    if (!this.desiredRunning || !this.autoRestartEnabled) {
-      this.phase = "error";
+    if (!this.desiredRunning) {
+      this.phase = "stopped";
       this.emit("status");
-      this.notify(
-        `Idle arrêté: ${reason}. Auto-restart désactivé${this.hasSteamGuard ? " (Steam Guard actif)" : ""}.`,
-        "error",
-      ).catch((error: unknown) =>
-        this.logger.warn({ error }, "Notification échouée"),
-      );
       return;
     }
 

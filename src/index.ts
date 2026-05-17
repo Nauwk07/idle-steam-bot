@@ -2,6 +2,7 @@ import { loadConfig } from "./config";
 import { createDiscordClient, DiscordBot } from "./bot/discord";
 import { initDatabase, closeDatabase } from "./db/index";
 import {
+  AuditRepository,
   GuildConfigRepository,
   UserAccountRepository,
   UserEventsRepository,
@@ -49,6 +50,7 @@ async function main() {
   const accounts = new UserAccountRepository();
   const games = new UserGamesRepository();
   const events = new UserEventsRepository();
+  const audit = new AuditRepository();
   const guildConfig = new GuildConfigRepository();
 
   const discordClient = createDiscordClient();
@@ -62,6 +64,7 @@ async function main() {
     accounts,
     games,
     events,
+    audit,
     guildConfig,
     logChannel,
     logger,

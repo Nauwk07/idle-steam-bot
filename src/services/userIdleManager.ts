@@ -30,7 +30,7 @@ export class UserIdleManager {
     const account = await this.accounts.findById(discordUserId);
     if (!account) throw new Error("Aucun compte Steam enregistré.\n- Utilise `/account setup` pour en configurer un.");
 
-    return this.createSession(discordUserId, account.steamUsername, account.encryptedPassword, account.encryptionIv, account.hasSteamGuard, account.autoRestartEnabled);
+    return this.createSession(discordUserId, account.steamUsername, account.encryptedPassword, account.encryptionIv);
   }
 
   /** Crée ou remplace la session pour un user (après /account setup). */
@@ -39,8 +39,6 @@ export class UserIdleManager {
     steamUsername: string,
     encryptedPassword: string,
     iv: string,
-    hasSteamGuard = false,
-    autoRestartEnabled = false,
   ): SteamIdleService {
     this.destroySession(discordUserId);
 
@@ -52,12 +50,9 @@ export class UserIdleManager {
       { username: steamUsername, password },
       this.config,
       this.games,
-      this.accounts,
       this.events,
       this.logger,
       notifier,
-      hasSteamGuard,
-      autoRestartEnabled,
     );
 
     this.sessions.set(discordUserId, service);

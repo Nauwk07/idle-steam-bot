@@ -1,6 +1,7 @@
 import { and, desc, eq, sql } from "drizzle-orm";
 import { getDb, schema } from "./index";
 import type {
+  AuditEvent,
   GuildConfig,
   NewUserAccount,
   UserAccount,
@@ -72,9 +73,6 @@ export class UserAccountRepository {
             steamUsername: account.steamUsername,
             encryptedPassword: account.encryptedPassword,
             encryptionIv: account.encryptionIv,
-            // Reset à false : la prochaine connexion remettra le bon flag
-            hasSteamGuard: false,
-            autoRestartEnabled: false,
             updatedAt: now,
           },
         });
@@ -86,27 +84,6 @@ export class UserAccountRepository {
       }
       throw err;
     }
-  }
-
-  async updateSteamGuardStatus(discordUserId: string, hasSteamGuard: boolean) {
-    const db = getDb();
-    await db
-      .update(schema.userAccounts)
-      .set({
-        hasSteamGuard,
-        // Si Steam Guard activé, on force la désactivation de l'auto-restart
-        autoRestartEnabled: hasSteamGuard ? false : undefined,
-        updatedAt: new Date(),
-      })
-      .where(eq(schema.userAccounts.discordUserId, discordUserId));
-  }
-
-  async setAutoRestart(discordUserId: string, enabled: boolean) {
-    const db = getDb();
-    await db
-      .update(schema.userAccounts)
-      .set({ autoRestartEnabled: enabled, updatedAt: new Date() })
-      .where(eq(schema.userAccounts.discordUserId, discordUserId));
   }
 
   async delete(discordUserId: string) {
@@ -210,5 +187,52 @@ export class UserEventsRepository {
       .where(eq(schema.userEvents.discordUserId, discordUserId))
       .orderBy(desc(schema.userEvents.createdAt))
       .limit(Math.max(1, Math.min(limit, 50)));
+  }
+}
+
+// ─── AuditRepository ──────────────────────────────────────────
+// Persistance des actions Discord sensibles (qui a fait quoi).
+
+export type AuditAction =
+  | "account.setup"
+  | "account.delete"
+  | "game.add"
+  | "game.delete"
+  | "idle.start"
+  | "idle.stop"
+  | "idle.restart"
+  | "idle.standby"
+  | "config.role"
+  | "config.log-channel";
+
+export type AuditLogInput = {
+  discordUserId: string;
+  guildId?: string | null;
+  action: AuditAction;
+  target?: string | null;
+  meta?: unknown;
+};
+
+export class AuditRepository {
+  async log(entry: AuditLogInput): Promise<void> {
+    const db = getDb();
+    await db.insert(schema.auditEvents).values({
+      discordUserId: entry.discordUserId,
+      guildId: entry.guildId ?? null,
+      action: entry.action,
+      target: entry.target ?? null,
+      meta: entry.meta !== undefined ? entry.meta : null,
+      createdAt: new Date(),
+    });
+  }
+
+  async recent(limit: number, filterUserId?: string): Promise<AuditEvent[]> {
+    const db = getDb();
+    const clamped = Math.max(1, Math.min(limit, 50));
+    const base = db.select().from(schema.auditEvents);
+    const query = filterUserId
+      ? base.where(eq(schema.auditEvents.discordUserId, filterUserId))
+      : base;
+    return query.orderBy(desc(schema.auditEvents.createdAt)).limit(clamped);
   }
 }

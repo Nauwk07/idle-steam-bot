@@ -34,10 +34,6 @@ export const userAccounts = pgTable(
     steamUsername: varchar("steam_username", { length: 100 }).notNull(),
     encryptedPassword: text("encrypted_password").notNull(),
     encryptionIv: varchar("encryption_iv", { length: 64 }).notNull(),
-    // Mis à jour à chaque connexion : true si Steam Guard a été demandé lors du dernier login
-    hasSteamGuard: boolean("has_steam_guard").notNull().default(false),
-    // Activable uniquement si hasSteamGuard = false
-    autoRestartEnabled: boolean("auto_restart_enabled").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
@@ -67,7 +63,8 @@ export const userGames = pgTable(
 export type UserGame = InferSelectModel<typeof userGames>;
 export type NewUserGame = InferInsertModel<typeof userGames>;
 
-// ─── User events (logs par user) ──────────────────────────────
+// ─── User events (logs techniques par user) ──────────────────
+// Émis par SteamIdleService — observabilité du process Steam (connexion, dévco, erreurs).
 export const userEvents = pgTable(
   "user_events",
   {
@@ -83,3 +80,25 @@ export const userEvents = pgTable(
 
 export type UserEvent = InferSelectModel<typeof userEvents>;
 export type NewUserEvent = InferInsertModel<typeof userEvents>;
+
+// ─── Audit events (traçabilité des actions Discord) ──────────
+// Une ligne par action utilisateur sensible (setup, delete, start, stop, ...).
+export const auditEvents = pgTable(
+  "audit_events",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    discordUserId: varchar("discord_user_id", { length: 20 }).notNull(),
+    guildId: varchar("guild_id", { length: 20 }),
+    action: varchar("action", { length: 64 }).notNull(),
+    target: varchar("target", { length: 200 }),
+    meta: jsonb("meta"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    index("idx_audit_events_user_created").on(t.discordUserId, t.createdAt),
+    index("idx_audit_events_action_created").on(t.action, t.createdAt),
+  ],
+);
+
+export type AuditEvent = InferSelectModel<typeof auditEvents>;
+export type NewAuditEvent = InferInsertModel<typeof auditEvents>;

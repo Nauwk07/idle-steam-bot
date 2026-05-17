@@ -20,6 +20,7 @@ import {
 
 import type { AppConfig } from "../config";
 import type {
+  AuditRepository,
   GuildConfigRepository,
   UserAccountRepository,
   UserEventsRepository,
@@ -36,9 +37,15 @@ import {
 import { SteamIdleService, type IdleStatus } from "../steam/steamIdleService";
 import { encrypt } from "../utils/encryption";
 import { brandedEmbed, type EmbedType } from "../utils/embeds";
-import { formatBoolean, formatDuration, formatRelativeTimestamp } from "../utils/format";
+import { formatDuration, formatRelativeTimestamp } from "../utils/format";
 import { createBotLog, logCommand, type BotLog } from "../utils/log";
 import { commandDefinitions } from "./commands";
+import {
+  resolveModalHandler,
+  resolveSubHandler,
+  type CommandMap,
+  type ModalHandler,
+} from "./dispatch";
 
 const MODAL_STEAM_GUARD_PREFIX = "steamguard";
 const MODAL_ACCOUNT_SETUP_ID = "account_setup";
@@ -52,6 +59,8 @@ export function createDiscordClient() {
 
 export class DiscordBot {
   private readonly log: BotLog;
+  private readonly commands: CommandMap;
+  private readonly modals: ModalHandler[];
 
   constructor(
     private readonly client: Client,
@@ -60,11 +69,14 @@ export class DiscordBot {
     private readonly accounts: UserAccountRepository,
     private readonly games: UserGamesRepository,
     private readonly events: UserEventsRepository,
+    private readonly audit: AuditRepository,
     private readonly guildConfig: GuildConfigRepository,
     private readonly logChannel: LogChannelService,
     private readonly logger: AppLogger,
   ) {
     this.log = createBotLog(logger);
+    this.commands = this.buildCommandMap();
+    this.modals = this.buildModalHandlers();
   }
 
   async start() {
@@ -124,7 +136,6 @@ export class DiscordBot {
 
   private async hasAccess(interaction: ChatInputCommandInteraction): Promise<boolean> {
     if (this.isOwner(interaction.user.id)) return true;
-
     if (interaction.guildId !== this.config.discord.guildId) return false;
 
     const cfg = await this.guildConfig.get(this.config.discord.guildId);
@@ -136,30 +147,75 @@ export class DiscordBot {
     return member.roles.cache.has(cfg.allowedRoleId);
   }
 
-  // ─── Interaction router ──────────────────────────────────────
+  // ─── Dispatch ───────────────────────────────────────────────
+
+  private buildCommandMap(): CommandMap {
+    return {
+      config: {
+        status: { fn: (i) => this.configStatus(i), publicAccess: true },
+        role: { fn: (i) => this.configSetRole(i), ownerOnly: true, publicAccess: true },
+        "log-channel": { fn: (i) => this.configSetLogChannel(i), ownerOnly: true, publicAccess: true },
+      },
+      account: {
+        setup: { fn: (i) => this.accountSetup(i) },
+        status: { fn: (i) => this.accountStatus(i) },
+        delete: { fn: (i) => this.accountDelete(i) },
+      },
+      idle: {
+        start: { fn: (i) => this.idleStart(i) },
+        stop: { fn: (i) => this.idleStop(i) },
+        restart: { fn: (i) => this.idleRestart(i) },
+        status: { fn: (i) => this.idleStatus(i) },
+        logs: { fn: (i) => this.idleLogs(i) },
+        standby: { fn: (i) => this.idleStandby(i) },
+      },
+      game: {
+        add: { fn: (i) => this.gameAdd(i) },
+        delete: { fn: (i) => this.gameDelete(i) },
+        list: { fn: (i) => this.gameList(i) },
+        search: { fn: (i) => this.gameSearch(i) },
+      },
+      audit: {
+        list: { fn: (i) => this.auditList(i), ownerOnly: true },
+      },
+    };
+  }
+
+  private buildModalHandlers(): ModalHandler[] {
+    return [
+      {
+        match: (id) => id === MODAL_ACCOUNT_SETUP_ID,
+        fn: (i) => this.handleAccountSetupModal(i),
+      },
+      {
+        match: (id) => id.startsWith(`${MODAL_STEAM_GUARD_PREFIX}:`),
+        fn: (i) => this.handleSteamGuardModal(i),
+      },
+    ];
+  }
 
   private async handleInteraction(interaction: ChatInputCommandInteraction) {
     try {
       logCommand(this.log, interaction, "received");
 
-      if (interaction.commandName === "config") {
-        await this.handleConfig(interaction);
+      const sub = interaction.options.getSubcommand(false);
+      const handler = sub ? resolveSubHandler(this.commands, interaction.commandName, sub) : null;
+      if (!handler) {
+        await this.replyEphemeral(interaction, "warn", "Commande inconnue", "Cette sous-commande n'existe pas.");
         return;
       }
 
-      if (!(await this.hasAccess(interaction))) {
+      if (!handler.publicAccess && !(await this.hasAccess(interaction))) {
         await this.replyEphemeral(interaction, "error", "Accès refusé", "Tu n'as pas le rôle requis pour utiliser ce bot.");
         return;
       }
 
-      if (interaction.commandName === "account") {
-        await this.handleAccount(interaction);
-      } else if (interaction.commandName === "idle") {
-        await this.handleIdle(interaction);
-      } else if (interaction.commandName === "game") {
-        await this.handleGame(interaction);
+      if (handler.ownerOnly && !this.isOwner(interaction.user.id)) {
+        await this.replyEphemeral(interaction, "error", "Accès refusé", "Réservé au owner du bot.");
+        return;
       }
 
+      await handler.fn(interaction);
       logCommand(this.log, interaction, "success");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -171,13 +227,8 @@ export class DiscordBot {
 
   private async handleModal(interaction: ModalSubmitInteraction) {
     try {
-      if (interaction.customId === MODAL_ACCOUNT_SETUP_ID) {
-        await this.handleAccountSetupModal(interaction);
-        return;
-      }
-      if (interaction.customId.startsWith(`${MODAL_STEAM_GUARD_PREFIX}:`)) {
-        await this.handleSteamGuardModal(interaction);
-      }
+      const handler = resolveModalHandler(this.modals, interaction.customId);
+      if (handler) await handler.fn(interaction);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error({ error }, "Modal Discord échoué");
@@ -190,98 +241,59 @@ export class DiscordBot {
 
   // ─── /config ─────────────────────────────────────────────────
 
-  private async handleConfig(interaction: ChatInputCommandInteraction) {
-    const sub = interaction.options.getSubcommand();
+  private async configStatus(interaction: ChatInputCommandInteraction) {
     const guild = interaction.guild;
-
     if (!guild) {
       await this.replyEphemeral(interaction, "error", "Erreur", "Cette commande doit être utilisée dans un serveur.");
       return;
     }
+    const cfg = await this.guildConfig.get(guild.id);
+    const lines = [
+      `- **Rôle autorisé** : ${cfg?.allowedRoleId ? `<@&${cfg.allowedRoleId}>` : "non configuré"}`,
+      `- **Channel de logs** : ${cfg?.logChannelId ? `<#${cfg.logChannelId}>` : "non configuré"}`,
+    ];
+    await this.replyEphemeral(interaction, "info", "Configuration", lines.join("\n"));
+  }
 
-    if (sub === "status") {
-      const cfg = await this.guildConfig.get(guild.id);
-      const lines = [
-        `- **Rôle autorisé** : ${cfg?.allowedRoleId ? `<@&${cfg.allowedRoleId}>` : "non configuré"}`,
-        `- **Channel de logs** : ${cfg?.logChannelId ? `<#${cfg.logChannelId}>` : "non configuré"}`,
-      ];
-      await this.replyEphemeral(interaction, "info", "Configuration", lines.join("\n"));
+  private async configSetRole(interaction: ChatInputCommandInteraction) {
+    const guild = interaction.guild;
+    if (!guild) throw new Error("Cette commande doit être utilisée dans un serveur.");
+    const role = interaction.options.getRole("role", true);
+    await this.guildConfig.setAllowedRole(guild.id, role.id);
+    await this.audit.log({
+      discordUserId: interaction.user.id,
+      guildId: guild.id,
+      action: "config.role",
+      target: role.id,
+      meta: { roleName: role.name },
+    });
+    this.log("info", "Rôle autorisé configuré", { guildId: guild.id, roleId: role.id });
+    await this.replyEphemeral(interaction, "success", "Rôle configuré", `- **Rôle** : <@&${role.id}>`);
+  }
+
+  private async configSetLogChannel(interaction: ChatInputCommandInteraction) {
+    const guild = interaction.guild;
+    if (!guild) throw new Error("Cette commande doit être utilisée dans un serveur.");
+    const channel = interaction.options.getChannel("channel", true);
+    if (channel.type !== ChannelType.GuildText) {
+      await this.replyEphemeral(interaction, "error", "Erreur", "Le channel doit être un salon texte.");
       return;
     }
-
-    if (!this.isOwner(interaction.user.id)) {
-      await this.replyEphemeral(interaction, "error", "Accès refusé", "Réservé au owner du bot.");
-      return;
-    }
-
-    if (sub === "role") {
-      const role = interaction.options.getRole("role", true);
-      await this.guildConfig.setAllowedRole(guild.id, role.id);
-      this.log("info", "Rôle autorisé configuré", { guildId: guild.id, roleId: role.id });
-      await this.replyEphemeral(interaction, "success", "Rôle configuré", `- **Rôle** : <@&${role.id}>`);
-      return;
-    }
-
-    if (sub === "log-channel") {
-      const channel = interaction.options.getChannel("channel", true);
-      if (channel.type !== ChannelType.GuildText) {
-        await this.replyEphemeral(interaction, "error", "Erreur", "Le channel doit être un salon texte.");
-        return;
-      }
-      await this.guildConfig.setLogChannel(guild.id, channel.id);
-      this.log("info", "Channel de logs configuré", { guildId: guild.id, channelId: channel.id });
-      await this.replyEphemeral(interaction, "success", "Channel de logs configuré", `- **Channel** : <#${channel.id}>`);
-    }
+    await this.guildConfig.setLogChannel(guild.id, channel.id);
+    await this.audit.log({
+      discordUserId: interaction.user.id,
+      guildId: guild.id,
+      action: "config.log-channel",
+      target: channel.id,
+      meta: { channelName: channel.name },
+    });
+    this.log("info", "Channel de logs configuré", { guildId: guild.id, channelId: channel.id });
+    await this.replyEphemeral(interaction, "success", "Channel de logs configuré", `- **Channel** : <#${channel.id}>`);
   }
 
   // ─── /account ────────────────────────────────────────────────
 
-  private async handleAccount(interaction: ChatInputCommandInteraction) {
-    const sub = interaction.options.getSubcommand();
-
-    if (sub === "setup") {
-      await this.showAccountSetupModal(interaction);
-      return;
-    }
-
-    if (sub === "status") {
-      const account = await this.accounts.findById(interaction.user.id);
-      if (!account) {
-        await this.replyEphemeral(interaction, "warn", "Compte Steam", "Aucun compte enregistré.\n- Utilise `/account setup` pour en configurer un.");
-        return;
-      }
-      const lines = [
-        `- **Identifiant Steam** : \`${account.steamUsername}\``,
-        `- **Steam Guard** : ${formatBoolean(account.hasSteamGuard)}`,
-        `- **Auto-restart** : ${formatBoolean(account.autoRestartEnabled)}`,
-        `- **Enregistré le** : ${account.createdAt.toLocaleString("fr-FR")}`,
-      ];
-      await this.replyEphemeral(interaction, "info", "Ton compte Steam", lines.join("\n"));
-      return;
-    }
-
-    if (sub === "delete") {
-      const account = await this.accounts.findById(interaction.user.id);
-      if (!account) {
-        await this.replyEphemeral(interaction, "warn", "Compte Steam", "Aucun compte à supprimer.");
-        return;
-      }
-
-      const ok = await this.confirm(
-        interaction,
-        "Supprimer ton compte Steam ?",
-        `Tu vas supprimer \`${account.steamUsername}\` et **tous tes jeux**.\nCette action est irréversible.`,
-      );
-      if (!ok) return;
-
-      await this.idleManager.destroySession(interaction.user.id);
-      await this.accounts.delete(interaction.user.id);
-      this.log("info", "Compte Steam supprimé", { userId: interaction.user.id, username: account.steamUsername });
-      await this.logChannel.send(`Compte supprimé par <@${interaction.user.id}> (\`${account.steamUsername}\`)`, "warn");
-    }
-  }
-
-  private async showAccountSetupModal(interaction: ChatInputCommandInteraction) {
+  private async accountSetup(interaction: ChatInputCommandInteraction) {
     const existing = await this.accounts.findById(interaction.user.id);
 
     const modal = new ModalBuilder()
@@ -296,7 +308,6 @@ export class DiscordBot {
       .setMaxLength(64)
       .setRequired(true)
       .setStyle(TextInputStyle.Short);
-
     if (existing) usernameInput.setValue(existing.steamUsername);
 
     const passwordInput = new TextInputBuilder()
@@ -316,6 +327,45 @@ export class DiscordBot {
     await interaction.showModal(modal);
   }
 
+  private async accountStatus(interaction: ChatInputCommandInteraction) {
+    const account = await this.accounts.findById(interaction.user.id);
+    if (!account) {
+      await this.replyEphemeral(interaction, "warn", "Compte Steam", "Aucun compte enregistré.\n- Utilise `/account setup` pour en configurer un.");
+      return;
+    }
+    const lines = [
+      `- **Identifiant Steam** : \`${account.steamUsername}\``,
+      `- **Enregistré le** : ${account.createdAt.toLocaleString("fr-FR")}`,
+    ];
+    await this.replyEphemeral(interaction, "info", "Ton compte Steam", lines.join("\n"));
+  }
+
+  private async accountDelete(interaction: ChatInputCommandInteraction) {
+    const account = await this.accounts.findById(interaction.user.id);
+    if (!account) {
+      await this.replyEphemeral(interaction, "warn", "Compte Steam", "Aucun compte à supprimer.");
+      return;
+    }
+
+    const ok = await this.confirm(
+      interaction,
+      "Supprimer ton compte Steam ?",
+      `Tu vas supprimer \`${account.steamUsername}\` et **tous tes jeux**.\nCette action est irréversible.`,
+    );
+    if (!ok) return;
+
+    await this.idleManager.destroySession(interaction.user.id);
+    await this.accounts.delete(interaction.user.id);
+    await this.audit.log({
+      discordUserId: interaction.user.id,
+      guildId: interaction.guildId,
+      action: "account.delete",
+      target: account.steamUsername,
+    });
+    this.log("info", "Compte Steam supprimé", { userId: interaction.user.id, username: account.steamUsername });
+    await this.logChannel.send(`Compte supprimé par <@${interaction.user.id}> (\`${account.steamUsername}\`)`, "warn");
+  }
+
   private async handleAccountSetupModal(interaction: ModalSubmitInteraction) {
     const steamUsername = interaction.fields.getTextInputValue(INPUT_STEAM_USERNAME).trim();
     const steamPassword = interaction.fields.getTextInputValue(INPUT_STEAM_PASSWORD);
@@ -330,14 +380,14 @@ export class DiscordBot {
       encryptionIv: iv,
     });
 
-    // Recrée la session avec les nouveaux credentials
-    this.idleManager.createSession(
-      interaction.user.id,
-      steamUsername,
-      encrypted,
-      iv,
-    );
+    this.idleManager.createSession(interaction.user.id, steamUsername, encrypted, iv);
 
+    await this.audit.log({
+      discordUserId: interaction.user.id,
+      guildId: interaction.guildId,
+      action: "account.setup",
+      target: steamUsername,
+    });
     this.log("info", "Compte Steam enregistré", { userId: interaction.user.id, steamUsername });
     await this.logChannel.send(`Nouveau compte enregistré par <@${interaction.user.id}> (\`${steamUsername}\`)`, "info");
 
@@ -355,69 +405,63 @@ export class DiscordBot {
 
   // ─── /idle ───────────────────────────────────────────────────
 
-  private async handleIdle(interaction: ChatInputCommandInteraction) {
-    const sub = interaction.options.getSubcommand();
-    const userId = interaction.user.id;
-
-    if (sub === "start") {
-      if (!this.config.dryRun) {
-        await this.showSteamGuardModal(interaction, "start");
-        return;
-      }
-      const service = await this.idleManager.getOrCreate(userId);
-      await service.start("discord-command");
-      await this.replyEphemeral(interaction, "success", "Idle démarré", "L'idle est en cours de démarrage.");
+  private async idleStart(interaction: ChatInputCommandInteraction) {
+    if (!this.config.dryRun) {
+      await this.showSteamGuardModal(interaction, "start");
       return;
     }
+    const service = await this.idleManager.getOrCreate(interaction.user.id);
+    await service.start("discord-command");
+    await this.audit.log({
+      discordUserId: interaction.user.id,
+      guildId: interaction.guildId,
+      action: "idle.start",
+      meta: { dryRun: true },
+    });
+    await this.replyEphemeral(interaction, "success", "Idle démarré", "L'idle est en cours de démarrage.");
+  }
 
-    if (sub === "stop") {
-      const service = await this.idleManager.getOrCreate(userId);
-      await service.stop("discord-command");
-      await this.replyEphemeral(interaction, "success", "Idle arrêté", "L'idle a été arrêté.");
-      return;
-    }
+  private async idleStop(interaction: ChatInputCommandInteraction) {
+    const service = await this.idleManager.getOrCreate(interaction.user.id);
+    await service.stop("discord-command");
+    await this.audit.log({
+      discordUserId: interaction.user.id,
+      guildId: interaction.guildId,
+      action: "idle.stop",
+    });
+    await this.replyEphemeral(interaction, "success", "Idle arrêté", "L'idle a été arrêté.");
+  }
 
-    if (sub === "restart") {
-      await this.showSteamGuardModal(interaction, "restart");
-      return;
-    }
+  private async idleRestart(interaction: ChatInputCommandInteraction) {
+    await this.showSteamGuardModal(interaction, "restart");
+  }
 
-    if (sub === "status") {
-      await this.replyEphemeral(interaction, "info", "Statut Idle", await this.formatStatus(userId));
-      return;
-    }
+  private async idleStatus(interaction: ChatInputCommandInteraction) {
+    await this.replyEphemeral(interaction, "info", "Statut Idle", await this.formatStatus(interaction.user.id));
+  }
 
-    if (sub === "logs") {
-      const limit = interaction.options.getInteger("limit") ?? 20;
-      const rows = await this.events.recent(userId, limit);
-      const text = rows.length === 0
-        ? "Aucun log."
-        : rows
-            .map((row) => {
-              const date = row.createdAt.toLocaleString("fr-FR");
-              return `- ${formatLogLevel(row.level)} **${row.message}** — ${date}`;
-            })
-            .join("\n")
-            .slice(0, 3900);
-      await this.replyEphemeral(interaction, "info", "Logs", text);
-      return;
-    }
+  private async idleLogs(interaction: ChatInputCommandInteraction) {
+    const limit = interaction.options.getInteger("limit") ?? 20;
+    const rows = await this.events.recent(interaction.user.id, limit);
+    const text = rows.length === 0
+      ? "Aucun log."
+      : rows
+          .map((row) => `- ${formatLogLevel(row.level)} **${row.message}** — ${row.createdAt.toLocaleString("fr-FR")}`)
+          .join("\n");
+    await this.replyEphemeral(interaction, "info", "Logs", text);
+  }
 
-    if (sub === "standby") {
-      const active = interaction.options.getBoolean("active", true);
-      const service = await this.idleManager.getOrCreate(userId);
-      await service.setManualStandby(active);
-      await this.replyEphemeral(interaction, "success", "Standby", `- **État** : ${active ? "activé" : "désactivé"}`);
-      return;
-    }
-
-    if (sub === "autorestart") {
-      const active = interaction.options.getBoolean("active", true);
-      const service = await this.idleManager.getOrCreate(userId);
-      service.setAutoRestart(active);
-      await this.accounts.setAutoRestart(userId, active);
-      await this.replyEphemeral(interaction, "success", "Auto-restart", `- **État** : ${active ? "activé" : "désactivé"}`);
-    }
+  private async idleStandby(interaction: ChatInputCommandInteraction) {
+    const active = interaction.options.getBoolean("active", true);
+    const service = await this.idleManager.getOrCreate(interaction.user.id);
+    await service.setManualStandby(active);
+    await this.audit.log({
+      discordUserId: interaction.user.id,
+      guildId: interaction.guildId,
+      action: "idle.standby",
+      meta: { active },
+    });
+    await this.replyEphemeral(interaction, "success", "Standby", `- **État** : ${active ? "activé" : "désactivé"}`);
   }
 
   private async showSteamGuardModal(
@@ -465,6 +509,13 @@ export class DiscordBot {
       } else {
         await service.start("discord-modal", code);
       }
+
+      await this.audit.log({
+        discordUserId: userId,
+        guildId: interaction.guildId,
+        action: action === "restart" ? "idle.restart" : "idle.start",
+        meta: { withSteamGuardCode: Boolean(code) },
+      });
 
       const result = await this.waitForIdleResult(service);
       const status = service.getStatus();
@@ -524,70 +575,101 @@ export class DiscordBot {
 
   // ─── /game ───────────────────────────────────────────────────
 
-  private async handleGame(interaction: ChatInputCommandInteraction) {
-    const sub = interaction.options.getSubcommand();
+  private async gameAdd(interaction: ChatInputCommandInteraction) {
     const userId = interaction.user.id;
+    const appId = interaction.options.getInteger("appid", true);
+    const providedName = interaction.options.getString("name") ?? undefined;
+    const name = providedName ?? (await getSteamAppName(appId)) ?? undefined;
+    await this.games.upsert(userId, appId, name);
 
-    if (sub === "add") {
-      const appId = interaction.options.getInteger("appid", true);
-      const providedName = interaction.options.getString("name") ?? undefined;
-      const name = providedName ?? (await getSteamAppName(appId)) ?? undefined;
-      await this.games.upsert(userId, appId, name);
+    const session = this.idleManager.get(userId);
+    if (session) await session.applyGames("game-add");
 
-      const session = this.idleManager.get(userId);
-      if (session) await session.applyGames("game-add");
+    await this.audit.log({
+      discordUserId: userId,
+      guildId: interaction.guildId,
+      action: "game.add",
+      target: String(appId),
+      meta: { name },
+    });
+    await this.replyEphemeral(
+      interaction,
+      "success",
+      "Jeu ajouté",
+      [`- **Nom** : ${name ? `**${name}**` : "inconnu"}`, `- **AppID** : \`${appId}\``].join("\n"),
+    );
+  }
 
-      await this.replyEphemeral(
-        interaction,
-        "success",
-        "Jeu ajouté",
-        [`- **Nom** : ${name ? `**${name}**` : "inconnu"}`, `- **AppID** : \`${appId}\``].join("\n"),
-      );
-      return;
-    }
+  private async gameDelete(interaction: ChatInputCommandInteraction) {
+    const userId = interaction.user.id;
+    const appId = interaction.options.getInteger("appid", true);
 
-    if (sub === "delete") {
-      const appId = interaction.options.getInteger("appid", true);
+    const ok = await this.confirm(
+      interaction,
+      "Supprimer ce jeu ?",
+      `Tu vas retirer l'AppID \`${appId}\` de ta liste d'idle.`,
+    );
+    if (!ok) return;
 
-      const ok = await this.confirm(
-        interaction,
-        "Supprimer ce jeu ?",
-        `Tu vas retirer l'AppID \`${appId}\` de ta liste d'idle.`,
-      );
-      if (!ok) return;
+    await this.games.remove(userId, appId);
+    const session = this.idleManager.get(userId);
+    if (session) await session.applyGames("game-delete");
 
-      await this.games.remove(userId, appId);
-      const session = this.idleManager.get(userId);
-      if (session) await session.applyGames("game-delete");
-      return;
-    }
+    await this.audit.log({
+      discordUserId: userId,
+      guildId: interaction.guildId,
+      action: "game.delete",
+      target: String(appId),
+    });
+  }
 
-    if (sub === "list") {
-      const userGames = await this.games.list(userId, true);
-      const text = userGames.length === 0
-        ? "Aucun jeu configuré.\n- Utilise `/game add appid:<id>` pour en ajouter un."
-        : [`- **Total** : \`${userGames.length}\``, "", ...userGames.map((g) => `- **${g.name ?? "Inconnu"}** — \`${g.appId}\` ${g.enabled ? "" : "_(désactivé)_"}`)]
-            .join("\n")
-            .slice(0, 3900);
-      await this.replyEphemeral(interaction, "info", "Tes jeux", text);
-      return;
-    }
+  private async gameList(interaction: ChatInputCommandInteraction) {
+    const userGames = await this.games.list(interaction.user.id, true);
+    const text = userGames.length === 0
+      ? "Aucun jeu configuré.\n- Utilise `/game add appid:<id>` pour en ajouter un."
+      : [
+          `- **Total** : \`${userGames.length}\``,
+          "",
+          ...userGames.map((g) => `- **${g.name ?? "Inconnu"}** — \`${g.appId}\` ${g.enabled ? "" : "_(désactivé)_"}`),
+        ].join("\n");
+    await this.replyEphemeral(interaction, "info", "Tes jeux", text);
+  }
 
-    if (sub === "search") {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const query = interaction.options.getString("query", true);
-      const results = await searchSteamStore(query);
-      await interaction.editReply({
-        embeds: [
-          brandedEmbed(
-            this.client,
-            results.length > 0 ? "info" : "warn",
-            formatSearchResults(query, results),
-            "Recherche Steam",
-          ),
-        ],
-      });
-    }
+  private async gameSearch(interaction: ChatInputCommandInteraction) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const query = interaction.options.getString("query", true);
+    const results = await searchSteamStore(query);
+    await interaction.editReply({
+      embeds: [
+        brandedEmbed(
+          this.client,
+          results.length > 0 ? "info" : "warn",
+          formatSearchResults(query, results),
+          "Recherche Steam",
+        ),
+      ],
+    });
+  }
+
+  // ─── /audit ──────────────────────────────────────────────────
+
+  private async auditList(interaction: ChatInputCommandInteraction) {
+    const limit = interaction.options.getInteger("limit") ?? 20;
+    const targetUser = interaction.options.getUser("user");
+    const rows = await this.audit.recent(limit, targetUser?.id);
+
+    const text = rows.length === 0
+      ? "Aucune action enregistrée."
+      : rows
+          .map((row) => {
+            const date = `<t:${Math.floor(row.createdAt.getTime() / 1000)}:R>`;
+            const target = row.target ? ` — \`${row.target}\`` : "";
+            return `- ${date} <@${row.discordUserId}> **${row.action}**${target}`;
+          })
+          .join("\n");
+
+    const title = targetUser ? `Audit — <@${targetUser.id}>` : "Audit (tous utilisateurs)";
+    await this.replyEphemeral(interaction, "info", title, text);
   }
 
   // ─── Helpers ─────────────────────────────────────────────────
@@ -605,8 +687,6 @@ export class DiscordBot {
       `- **Idle** : ${phase}`,
       `- **Compte** : \`${account.steamUsername}\``,
       `- **Jeux** : \`${gameCount}\``,
-      `- **Auto-restart** : ${formatBoolean(account.autoRestartEnabled)}`,
-      `- **Steam Guard** : ${formatBoolean(account.hasSteamGuard)}`,
     ];
 
     if (status.startedAt && (status.phase === "running" || status.phase === "standby")) {
