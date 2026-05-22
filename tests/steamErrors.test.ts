@@ -3,6 +3,8 @@ import SteamUser from "steam-user";
 
 import {
   describeEResult,
+  formatReconnectNotification,
+  formatSteamDisconnect,
   isRealSessionTakeover,
   isUnrecoverableLoginError,
 } from "../src/steam/steamErrors";
@@ -44,6 +46,25 @@ describe("isUnrecoverableLoginError", () => {
     expect(isUnrecoverableLoginError(SteamUser.EResult.RateLimitExceeded)).toBe(false);
     expect(isUnrecoverableLoginError(SteamUser.EResult.LoggedInElsewhere)).toBe(false);
     expect(isUnrecoverableLoginError(undefined)).toBe(false);
+  });
+});
+
+describe("formatSteamDisconnect", () => {
+  it("formate NoConnection en français lisible", () => {
+    const out = formatSteamDisconnect(SteamUser.EResult.NoConnection, "NoConnection");
+    expect(out.summary).toBe("Connexion Steam perdue");
+    expect(out.body).toContain("Connexion Steam perdue");
+    expect(out.body).not.toContain("Idle arrêté");
+  });
+});
+
+describe("formatReconnectNotification", () => {
+  it("inclut tentative et délai sans préfixe Idle arrêté", () => {
+    const cause = formatSteamDisconnect(SteamUser.EResult.NoConnection, "NoConnection");
+    const msg = formatReconnectNotification(1, 10_000, cause);
+    expect(msg).toContain("tentative **1**");
+    expect(msg).toContain("10s");
+    expect(msg).not.toMatch(/Idle arrêté/i);
   });
 });
 

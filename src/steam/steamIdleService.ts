@@ -8,9 +8,15 @@ import type { AppLogger } from "../logger";
 import type { Notifier } from "../services/notifier";
 import { RATE_LIMIT_BACKOFF_MS, reconnectDelayMs } from "./reconnectStrategy";
 import {
-  describeEResult,
+  formatPlainError,
+  formatRateLimitNotification,
+  formatReconnectNotification,
+  formatSteamDisconnect,
+  formatSteamLoginError,
+  formatUnrecoverableNotification,
   isRealSessionTakeover,
   isUnrecoverableLoginError,
+  type SteamErrorPresentation,
 } from "./steamErrors";
 
 export type IdlePhase =
@@ -132,9 +138,9 @@ export class SteamIdleService extends EventEmitter {
     this.intentionalStop = false;
     this.standbyReason = null;
     this.realPlayingAppId = null;
-    this.startedAt = new Date();
 
     if (this.isDryRun()) {
+      this.startedAt = new Date();
       this.connected = true;
       this.phase = "running";
       this.reconnectAttempt = 0;
@@ -249,6 +255,7 @@ export class SteamIdleService extends EventEmitter {
       this.reconnectAttempt = 0;
       this.nextRestartAt = null;
       this.lastError = null;
+      this.startedAt = new Date();
       client.setPersona(SteamUser.EPersonaState.Online);
       this.log("info", "Connecté à Steam");
 
@@ -318,10 +325,10 @@ export class SteamIdleService extends EventEmitter {
         return;
       }
 
-      const reason = describeEResult(eresult, message);
-      this.lastError = `Déconnexion Steam: ${reason}`;
-      this.log("warn", this.lastError, { eresult, message });
-      this.scheduleRestart(this.lastError);
+      const cause = formatSteamDisconnect(eresult, message);
+      this.lastError = cause.summary;
+      this.log("warn", "Déconnexion Steam", { eresult, message, summary: cause.summary });
+      this.scheduleRestart(cause);
     });
 
     client.on("error", (error) => {
@@ -336,26 +343,25 @@ export class SteamIdleService extends EventEmitter {
         return;
       }
 
-      this.lastError = error.message;
+      const cause = formatSteamLoginError(error.eresult, error.message);
+      this.lastError = cause.summary;
       this.log("error", "Erreur Steam", {
         message: error.message,
         eresult: error.eresult,
+        summary: cause.summary,
       });
 
       if (isUnrecoverableLoginError(error.eresult)) {
-        this.handleUnrecoverableSteamError(
-          `Erreur Steam non récupérable: ${error.message}`,
-          { message: error.message, eresult: error.eresult },
-        );
+        this.handleUnrecoverableSteamError(cause, { message: error.message, eresult: error.eresult });
         return;
       }
 
       if (error.eresult === SteamUser.EResult.RateLimitExceeded) {
-        this.scheduleRateLimitBackoff(`Erreur Steam: ${error.message}`);
+        this.scheduleRateLimitBackoff(cause);
         return;
       }
 
-      this.scheduleRestart(`Erreur Steam: ${error.message}`);
+      this.scheduleRestart(cause);
     });
   }
 
@@ -391,7 +397,7 @@ export class SteamIdleService extends EventEmitter {
     }, this.config.steam.playScanIntervalMs);
   }
 
-  private scheduleRestart(reason: string) {
+  private scheduleRestart(cause: SteamErrorPresentation) {
     if (!this.desiredRunning) {
       this.phase = "stopped";
       this.emit("status");
@@ -402,11 +408,13 @@ export class SteamIdleService extends EventEmitter {
     this.reconnectAttempt += 1;
     const delayMs = reconnectDelayMs(this.reconnectAttempt);
     this.nextRestartAt = new Date(Date.now() + delayMs);
+    this.lastError = cause.summary;
     this.emit("status");
 
     this.notify(
-      `Idle arrêté: ${reason}. Auto-restart tentative ${this.reconnectAttempt} dans ${Math.round(delayMs / 1000)}s.`,
+      formatReconnectNotification(this.reconnectAttempt, delayMs, cause),
       "warn",
+      "Connexion Steam perdue",
     ).catch((error: unknown) =>
       this.logger.warn({ error }, "Notification auto-restart échouée"),
     );
@@ -422,16 +430,15 @@ export class SteamIdleService extends EventEmitter {
     }, delayMs);
   }
 
-  private scheduleRateLimitBackoff(reason: string) {
+  private scheduleRateLimitBackoff(cause: SteamErrorPresentation) {
     this.phase = "restarting";
     this.reconnectAttempt += 1;
     this.nextRestartAt = new Date(Date.now() + RATE_LIMIT_BACKOFF_MS);
+    this.lastError = cause.summary;
     this.emit("status");
 
-    this.notify(
-      `${reason}. Steam a rate-limit le login — pause de 60 min avant nouvelle tentative.`,
-      "warn",
-    ).catch((error: unknown) =>
+    this.notify(formatRateLimitNotification(cause, RATE_LIMIT_BACKOFF_MS), "warn", "Limite Steam").catch(
+      (error: unknown) =>
       this.logger.warn({ error }, "Notification rate-limit échouée"),
     );
 
@@ -496,9 +503,10 @@ export class SteamIdleService extends EventEmitter {
 
   private handleFatal(message: string, error: unknown) {
     const detail = error instanceof Error ? error.message : String(error);
-    this.lastError = `${message}: ${detail}`;
+    const cause = formatPlainError(`${message} : ${detail}`);
+    this.lastError = cause.summary;
     this.log("error", this.lastError);
-    this.scheduleRestart(this.lastError);
+    this.scheduleRestart(cause);
   }
 
   private stopForRealPlay(meta: unknown) {
@@ -524,20 +532,21 @@ export class SteamIdleService extends EventEmitter {
     );
   }
 
-  private handleUnrecoverableSteamError(message: string, meta?: unknown) {
+  private handleUnrecoverableSteamError(cause: SteamErrorPresentation, meta?: unknown) {
     this.clearRestartTimer();
     this.clearSteamGuardRequest();
     this.desiredRunning = false;
     this.intentionalStop = true;
     this.connected = false;
     this.phase = "error";
-    this.lastError = message;
+    this.lastError = cause.summary;
     this.client?.logOff();
     this.client = null;
     this.emit("status");
-    this.log("error", message, meta);
-    this.notify(`${message} Auto-restart stoppé.`, "error").catch((error: unknown) =>
-      this.logger.warn({ error }, "Notification erreur non récupérable échouée"),
+    this.log("error", cause.summary, meta);
+    this.notify(formatUnrecoverableNotification(cause), "error", "Connexion impossible").catch(
+      (error: unknown) =>
+        this.logger.warn({ error }, "Notification erreur non récupérable échouée"),
     );
   }
 

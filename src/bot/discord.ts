@@ -526,11 +526,45 @@ export class DiscordBot {
         });
       } else if (result === "steam-guard") {
         await interaction.editReply({
-          embeds: [brandedEmbed(this.client, "warn", "Code Steam Guard requis.\n- Relance `/idle start` et saisis le code reçu par email ou l'appli Steam.")],
+          embeds: [
+            brandedEmbed(
+              this.client,
+              "warn",
+              [
+                "Steam demande un code de vérification.",
+                "- Relance `/idle start` et saisis le code reçu par **email** ou l'**appli Steam Guard**.",
+              ].join("\n"),
+              "Code Steam Guard requis",
+            ),
+          ],
+        });
+      } else if (result === "reconnecting") {
+        const lines = [
+          "La connexion a été coupée par Steam avant d'être stable.",
+          status.lastError ? `- **Cause** : ${status.lastError}` : null,
+          status.nextRestartAt
+            ? `- **Prochaine tentative** : ${formatRelativeTimestamp(status.nextRestartAt)}`
+            : "- **Reconnexion** : en cours…",
+          "- L'idle repartira tout seul. Suis avec `/idle status`.",
+        ].filter((line): line is string => line !== null);
+        await interaction.editReply({
+          embeds: [brandedEmbed(this.client, "warn", lines.join("\n"), "Connexion interrompue")],
         });
       } else {
+        const detail =
+          status.lastError ??
+          (status.phase === "starting"
+            ? "Délai de connexion dépassé (20 s). Vérifie réseau, identifiants et Steam Guard."
+            : "La connexion Steam n'a pas abouti.");
         await interaction.editReply({
-          embeds: [brandedEmbed(this.client, "error", `Connexion échouée.\n- ${status.lastError ?? "Erreur inconnue."}`)],
+          embeds: [
+            brandedEmbed(
+              this.client,
+              "error",
+              [`**${detail}**`, "- Consulte `/idle status` et `/idle logs` pour le détail."].join("\n"),
+              "Connexion échouée",
+            ),
+          ],
         });
       }
     } catch (error) {
@@ -544,26 +578,35 @@ export class DiscordBot {
   private waitForIdleResult(
     service: SteamIdleService,
     timeoutMs = 20_000,
-  ): Promise<"running" | "steam-guard" | "error"> {
-    const classify = (): "running" | "steam-guard" | "error" | null => {
+  ): Promise<"running" | "steam-guard" | "reconnecting" | "error"> {
+    const classify = (): "running" | "steam-guard" | "reconnecting" | "error" | null => {
       if (service.hasPendingSteamGuard()) return "steam-guard";
       const s = service.getStatus();
       if (s.phase === "running" || s.phase === "standby") return "running";
+      if (s.phase === "restarting") return "reconnecting";
       if (s.phase === "error") return "error";
       return null;
+    };
+
+    const resolveOnTimeout = (): "running" | "steam-guard" | "reconnecting" | "error" => {
+      const s = service.getStatus();
+      if (s.phase === "restarting") return "reconnecting";
+      if (s.phase === "running" || s.phase === "standby") return "running";
+      if (service.hasPendingSteamGuard()) return "steam-guard";
+      return "error";
     };
 
     const immediate = classify();
     if (immediate) return Promise.resolve(immediate);
 
     return new Promise((resolve) => {
-      const finish = (result: "running" | "steam-guard" | "error") => {
+      const finish = (result: "running" | "steam-guard" | "reconnecting" | "error") => {
         clearTimeout(timer);
         service.off("status", handler);
         resolve(result);
       };
 
-      const timer = setTimeout(() => finish(classify() ?? "running"), timeoutMs);
+      const timer = setTimeout(() => finish(resolveOnTimeout()), timeoutMs);
       const handler = () => {
         const r = classify();
         if (r) finish(r);
@@ -697,7 +740,10 @@ export class DiscordBot {
       lines.push(`- **Prochain restart** : ${formatRelativeTimestamp(status.nextRestartAt)}`);
     }
     if (status.standbyReason) lines.push(`- **Standby** : ${status.standbyReason}`);
-    if (status.lastError) lines.push(`- **Erreur** : ${status.lastError}`);
+    if (status.lastError) {
+      const errLabel = status.phase === "restarting" ? "Dernière erreur" : "Erreur";
+      lines.push(`- **${errLabel}** : ${status.lastError}`);
+    }
 
     return lines.join("\n");
   }
