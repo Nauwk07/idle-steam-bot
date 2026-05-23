@@ -240,8 +240,8 @@ export class UserEventsRepository {
     const [agg] = await db
       .select({
         totalEvents: sql<number>`count(*)::int`,
-        firstAt: sql<Date | null>`min(${schema.userEvents.createdAt})`,
-        lastAt: sql<Date | null>`max(${schema.userEvents.createdAt})`,
+        firstAt: sql<string | null>`min(${schema.userEvents.createdAt})`,
+        lastAt: sql<string | null>`max(${schema.userEvents.createdAt})`,
       })
       .from(schema.userEvents)
       .where(eq(schema.userEvents.discordUserId, discordUserId));
@@ -259,8 +259,8 @@ export class UserEventsRepository {
     return {
       totalSessions: sessRow?.count ?? 0,
       totalEvents: agg?.totalEvents ?? 0,
-      firstActivityAt: agg?.firstAt ?? null,
-      lastActivityAt: agg?.lastAt ?? null,
+      firstActivityAt: agg?.firstAt ? new Date(agg.firstAt) : null,
+      lastActivityAt: agg?.lastAt ? new Date(agg.lastAt) : null,
     };
   }
 }
