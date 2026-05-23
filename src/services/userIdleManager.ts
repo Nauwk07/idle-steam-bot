@@ -8,7 +8,7 @@ import type {
 import type { AppLogger } from "../logger";
 import { UserDMNotifier } from "./notifier";
 import { SteamIdleService } from "../steam/steamIdleService";
-import { decrypt } from "../utils/encryption";
+import { decrypt, encrypt } from "../utils/encryption";
 
 export class UserIdleManager {
   private sessions = new Map<string, SteamIdleService>();
@@ -30,7 +30,18 @@ export class UserIdleManager {
     const account = await this.accounts.findById(discordUserId);
     if (!account) throw new Error("Aucun compte Steam enregistré.\n- Utilise `/account setup` pour en configurer un.");
 
-    return this.createSession(discordUserId, account.steamUsername, account.encryptedPassword, account.encryptionIv);
+    const refreshToken =
+      account.refreshToken && account.refreshTokenIv
+        ? decrypt(account.refreshToken, account.refreshTokenIv, this.config.encryptionKey)
+        : null;
+
+    return this.createSession(
+      discordUserId,
+      account.steamUsername,
+      account.encryptedPassword,
+      account.encryptionIv,
+      refreshToken,
+    );
   }
 
   /** Crée ou remplace la session pour un user (après /account setup). */
@@ -39,20 +50,31 @@ export class UserIdleManager {
     steamUsername: string,
     encryptedPassword: string,
     iv: string,
+    refreshToken: string | null = null,
   ): SteamIdleService {
     this.destroySession(discordUserId);
 
     const password = decrypt(encryptedPassword, iv, this.config.encryptionKey);
     const notifier = new UserDMNotifier(this.client, discordUserId);
 
+    const onRefreshToken = async (token: string | null) => {
+      if (token === null) {
+        await this.accounts.updateRefreshToken(discordUserId, null, null);
+        return;
+      }
+      const { encrypted, iv: tokenIv } = encrypt(token, this.config.encryptionKey);
+      await this.accounts.updateRefreshToken(discordUserId, encrypted, tokenIv);
+    };
+
     const service = new SteamIdleService(
       discordUserId,
-      { username: steamUsername, password },
+      { username: steamUsername, password, refreshToken },
       this.config,
       this.games,
       this.events,
       this.logger,
       notifier,
+      onRefreshToken,
     );
 
     this.sessions.set(discordUserId, service);

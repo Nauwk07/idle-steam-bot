@@ -37,7 +37,7 @@ import {
 import { SteamIdleService, type IdleStatus } from "../steam/steamIdleService";
 import { encrypt } from "../utils/encryption";
 import { brandedEmbed, type EmbedType } from "../utils/embeds";
-import { formatDuration } from "../utils/format";
+import { formatDuration, formatRelativeTimestamp } from "../utils/format";
 import { createBotLog, logCommand, type BotLog } from "../utils/log";
 import { commandDefinitions } from "./commands";
 import {
@@ -171,12 +171,14 @@ export class DiscordBot {
         status: { fn: (i) => this.idleStatus(i) },
         logs: { fn: (i) => this.idleLogs(i) },
         standby: { fn: (i) => this.idleStandby(i) },
+        stats: { fn: (i) => this.idleStats(i) },
       },
       game: {
         add: { fn: (i) => this.gameAdd(i) },
         delete: { fn: (i) => this.gameDelete(i) },
         list: { fn: (i) => this.gameList(i) },
         search: { fn: (i) => this.gameSearch(i) },
+        bulk: { fn: (i) => this.gameBulk(i) },
       },
       audit: {
         list: { fn: (i) => this.auditList(i), ownerOnly: true },
@@ -632,6 +634,61 @@ export class DiscordBot {
     );
   }
 
+  private async gameBulk(interaction: ChatInputCommandInteraction) {
+    const userId = interaction.user.id;
+    const raw = interaction.options.getString("appids", true);
+
+    const tokens = raw.split(/[\s,]+/).filter(Boolean);
+    const valid: number[] = [];
+    const invalid: string[] = [];
+
+    for (const token of tokens) {
+      const n = parseInt(token, 10);
+      if (Number.isInteger(n) && n > 0 && String(n) === token.trim()) {
+        valid.push(n);
+      } else {
+        invalid.push(token);
+      }
+    }
+
+    if (valid.length === 0) {
+      await this.replyEphemeral(interaction, "warn", "Aucun AppID valide", "Vérifie le format : `440 570 730`.");
+      return;
+    }
+
+    const unique = [...new Set(valid)];
+    await Promise.all(unique.map((appId) => this.games.upsert(userId, appId)));
+
+    const session = this.idleManager.get(userId);
+    if (session) await session.applyGames("game-bulk");
+
+    await this.audit.log({
+      discordUserId: userId,
+      guildId: interaction.guildId,
+      action: "game.add",
+      target: `bulk:${unique.length}`,
+      meta: { appIds: unique },
+    });
+
+    const lines = [`- **Ajoutés** : \`${unique.length}\` jeu${unique.length > 1 ? "x" : ""}`];
+    if (invalid.length > 0) lines.push(`- **Invalides** : ${invalid.map((s) => `\`${s}\``).join(", ")}`);
+    lines.push("- Les noms seront récupérés en arrière-plan.");
+
+    await this.replyEphemeral(interaction, "success", "Jeux ajoutés", lines.join("\n"));
+
+    void this.backfillBulkNames(userId, unique);
+  }
+
+  private async backfillBulkNames(userId: string, appIds: number[]) {
+    for (const appId of appIds) {
+      try {
+        const name = await getSteamAppName(appId);
+        if (name) await this.games.updateName(userId, appId, name);
+        await new Promise((r) => setTimeout(r, 200));
+      } catch { /* best effort */ }
+    }
+  }
+
   private async gameDelete(interaction: ChatInputCommandInteraction) {
     const userId = interaction.user.id;
     const appId = interaction.options.getInteger("appid", true);
@@ -759,6 +816,37 @@ export class DiscordBot {
 
   // ─── Helpers ─────────────────────────────────────────────────
 
+  private async idleStats(interaction: ChatInputCommandInteraction) {
+    const userId = interaction.user.id;
+    const account = await this.accounts.findById(userId);
+    if (!account) {
+      await this.replyEphemeral(interaction, "warn", "Stats idle", "Aucun compte Steam enregistré.");
+      return;
+    }
+
+    const [userStats, gameCount] = await Promise.all([
+      this.events.stats(userId),
+      this.games.countEnabled(userId),
+    ]);
+
+    const lines: string[] = [
+      `- **Compte** : \`${account.steamUsername}\``,
+      `- **Sessions** : \`${userStats.totalSessions}\``,
+      `- **Jeux actifs** : \`${gameCount}\``,
+    ];
+
+    if (userStats.firstActivityAt) {
+      const ts = Math.floor(userStats.firstActivityAt.getTime() / 1000);
+      lines.push(`- **Première activité** : <t:${ts}:D>`);
+    }
+    if (userStats.lastActivityAt) {
+      const ts = Math.floor(userStats.lastActivityAt.getTime() / 1000);
+      lines.push(`- **Dernière activité** : <t:${ts}:R>`);
+    }
+
+    await this.replyEphemeral(interaction, "info", "Tes stats idle", lines.join("\n"));
+  }
+
   private async formatStatus(userId: string): Promise<string> {
     const account = await this.accounts.findById(userId);
     if (!account) return "Aucun compte Steam enregistré.\n- Utilise `/account setup` pour en configurer un.";
@@ -766,17 +854,29 @@ export class DiscordBot {
     const session = this.idleManager.get(userId);
     const status: Partial<IdleStatus> = session?.getStatus() ?? {};
     const phase = status.phase ? translatePhase(status.phase) : "non démarré";
-    const gameCount = await this.games.countEnabled(userId);
+    const enabledGames = await this.games.list(userId, false);
 
     const lines: string[] = [
       `- **Idle** : ${phase}`,
       `- **Compte** : \`${account.steamUsername}\``,
-      `- **Jeux** : \`${gameCount}\``,
+      `- **Jeux** : \`${enabledGames.length}\``,
     ];
 
     if (status.startedAt && (status.phase === "running" || status.phase === "standby")) {
       const uptime = Date.now() - new Date(status.startedAt).getTime();
       if (uptime > 0) lines.push(`- **Uptime** : ${formatDuration(uptime)}`);
+    }
+
+    if (status.phase === "running" && status.activeAppIds?.length) {
+      const nameMap = new Map(enabledGames.map((g) => [g.appId, g.name]));
+      const shown = status.activeAppIds.slice(0, 5);
+      const labels = shown.map((id) => nameMap.get(id) ?? `\`${id}\``);
+      const extra = status.activeAppIds.length > 5 ? ` +${status.activeAppIds.length - 5}` : "";
+      lines.push(`- **En cours** : ${labels.join(", ")}${extra}`);
+    }
+
+    if (status.phase === "restarting" && status.nextRestartAt) {
+      lines.push(`- **Prochaine tentative** : ${formatRelativeTimestamp(status.nextRestartAt)} (n°${status.reconnectAttempt})`);
     }
     if (status.standbyReason) lines.push(`- **Standby** : ${status.standbyReason}`);
     if (status.lastError) lines.push(`- **Erreur** : ${status.lastError}`);
@@ -881,6 +981,7 @@ function translatePhase(phase: IdleStatus["phase"]) {
     starting: "démarrage",
     running: "actif",
     standby: "standby",
+    restarting: "reconnexion auto",
     error: "erreur",
   };
   return labels[phase];

@@ -6,6 +6,7 @@ import type { AppConfig } from "../config";
 import type { UserEventsRepository, UserGamesRepository } from "../db/repositories";
 import type { AppLogger } from "../logger";
 import type { Notifier } from "../services/notifier";
+import { formatDuration } from "../utils/format";
 import {
   formatSteamDisconnect,
   formatSteamLoginError,
@@ -14,11 +15,20 @@ import {
   isUnrecoverableLoginError,
 } from "./steamErrors";
 
+// Délais de reconnexion : 10s, 30s, 1min, 5min, 5min, 5min…
+const RECONNECT_BACKOFF_SECONDS = [10, 30, 60, 300];
+
+function reconnectDelayMs(attempt: number): number {
+  const idx = Math.min(attempt - 1, RECONNECT_BACKOFF_SECONDS.length - 1);
+  return (RECONNECT_BACKOFF_SECONDS[Math.max(0, idx)] ?? 300) * 1000;
+}
+
 export type IdlePhase =
   | "stopped"
   | "starting"
   | "running"
   | "standby"
+  | "restarting"
   | "error";
 
 export type IdleStatus = {
@@ -28,6 +38,8 @@ export type IdleStatus = {
   activeAppIds: number[];
   standbyReason: string | null;
   realPlayingAppId: number | null;
+  reconnectAttempt: number;
+  nextRestartAt: string | null;
   startedAt: string | null;
   lastError: string | null;
 };
@@ -41,6 +53,7 @@ type SteamGuardRequest = {
 type SteamCredentials = {
   username: string;
   password: string;
+  refreshToken: string | null;
 };
 
 const STEAM_GUARD_TIMEOUT_MS = 5 * 60 * 1000;
@@ -53,6 +66,9 @@ export class SteamIdleService extends EventEmitter {
   private standbyReason: string | null = null;
   private realPlayingAppId: number | null = null;
   private currentAppIds: number[] = [];
+  private reconnectAttempt = 0;
+  private restartTimer: NodeJS.Timeout | null = null;
+  private nextRestartAt: Date | null = null;
   private resumeTimer: NodeJS.Timeout | null = null;
   private pendingSteamGuard: SteamGuardRequest | null = null;
   private startedAt: Date | null = null;
@@ -68,6 +84,7 @@ export class SteamIdleService extends EventEmitter {
     private readonly events: UserEventsRepository,
     private readonly logger: AppLogger,
     private readonly notifier: Notifier,
+    private readonly onRefreshToken: (token: string | null) => Promise<void>,
   ) {
     super();
   }
@@ -80,6 +97,8 @@ export class SteamIdleService extends EventEmitter {
       activeAppIds: [...this.currentAppIds],
       standbyReason: this.standbyReason,
       realPlayingAppId: this.realPlayingAppId,
+      reconnectAttempt: this.reconnectAttempt,
+      nextRestartAt: this.nextRestartAt?.toISOString() ?? null,
       startedAt: this.startedAt?.toISOString() ?? null,
       lastError: this.lastError,
     };
@@ -130,6 +149,8 @@ export class SteamIdleService extends EventEmitter {
       this.startedAt = new Date();
       this.connected = true;
       this.phase = "running";
+      this.reconnectAttempt = 0;
+      this.nextRestartAt = null;
       const count = await this.games.countEnabled(this.discordUserId);
       this.log("info", "Idle dry-run démarré", { reason });
       this.emit("status");
@@ -147,29 +168,38 @@ export class SteamIdleService extends EventEmitter {
 
     this.phase = "starting";
     this.emit("status");
-    this.log("info", "Connexion Steam en cours", { reason });
+    this.log("info", "Connexion Steam en cours", { reason, usingToken: !!this.credentials.refreshToken && !steamGuardCode });
 
     const client = new SteamUser();
     this.client = client;
     this.bindClient(client);
 
-    client.logOn({
-      accountName: this.credentials.username,
-      password: this.credentials.password,
-      twoFactorCode: steamGuardCode,
-      machineName: "idle-steam-discord-bot",
-      autoRelogin: false,
-    });
+    if (this.credentials.refreshToken && !steamGuardCode) {
+      client.logOn({
+        refreshToken: this.credentials.refreshToken,
+        machineName: "idle-steam-discord-bot",
+      });
+    } else {
+      client.logOn({
+        accountName: this.credentials.username,
+        password: this.credentials.password,
+        twoFactorCode: steamGuardCode,
+        machineName: "idle-steam-discord-bot",
+        autoRelogin: false,
+      });
+    }
   }
 
   private async stopInternal(reason = "manual") {
     this.desiredRunning = false;
     this.intentionalStop = true;
+    this.clearRestartTimer();
     this.clearResumeTimer();
     this.clearSteamGuardRequest();
     this.standbyReason = null;
     this.realPlayingAppId = null;
     this.currentAppIds = [];
+    this.nextRestartAt = null;
 
     if (this.client && this.connected) {
       this.client.gamesPlayed([]);
@@ -235,9 +265,12 @@ export class SteamIdleService extends EventEmitter {
     client.on("loggedOn", () => {
       if (client !== this.client) return;
 
+      const wasAutoRestart = this.reconnectAttempt > 0;
       this.connected = true;
       this.clearSteamGuardRequest();
       this.phase = "running";
+      this.reconnectAttempt = 0;
+      this.nextRestartAt = null;
       this.lastError = null;
       this.startedAt = new Date();
       client.setPersona(SteamUser.EPersonaState.Online);
@@ -248,6 +281,20 @@ export class SteamIdleService extends EventEmitter {
       });
 
       this.emit("status");
+
+      if (wasAutoRestart) {
+        this.notify("Reconnexion réussie — idle actif.", "success", "Connecté à Steam").catch(
+          (err: unknown) => this.logger.warn({ err }, "Notification reconnexion réussie échouée"),
+        );
+      }
+    });
+
+    client.on("refreshToken", (token: string) => {
+      if (client !== this.client) return;
+      this.credentials.refreshToken = token;
+      this.onRefreshToken(token).catch((err: unknown) => {
+        this.logger.warn({ err, discordUserId: this.discordUserId }, "Sauvegarde refresh token échouée");
+      });
     });
 
     client.on("steamGuard", (domain, callback, lastCodeWrong) => {
@@ -311,18 +358,23 @@ export class SteamIdleService extends EventEmitter {
 
       const cause = formatSteamDisconnect(eresult, message);
       this.lastError = cause.summary;
-      this.phase = "error";
-      this.desiredRunning = false;
-      this.intentionalStop = true;
       this.log("warn", "Déconnexion Steam", { eresult, message, summary: cause.summary });
-      this.emit("status");
-      this.notify(
-        `Connexion Steam perdue : ${cause.summary}\nRelance \`/idle start\` quand les serveurs sont disponibles.`,
-        "error",
-        "Connexion Steam perdue",
-      ).catch((error: unknown) =>
-        this.logger.warn({ error }, "Notification déconnexion échouée"),
-      );
+
+      if (this.credentials.refreshToken) {
+        this.scheduleRestart();
+      } else {
+        this.phase = "error";
+        this.desiredRunning = false;
+        this.intentionalStop = true;
+        this.emit("status");
+        this.notify(
+          `Connexion Steam perdue : ${cause.summary}\nRelance \`/idle start\` quand les serveurs sont disponibles.`,
+          "error",
+          "Connexion Steam perdue",
+        ).catch((err: unknown) =>
+          this.logger.warn({ err }, "Notification déconnexion échouée"),
+        );
+      }
     });
 
     client.on("error", (error) => {
@@ -350,18 +402,54 @@ export class SteamIdleService extends EventEmitter {
         return;
       }
 
-      this.phase = "error";
-      this.desiredRunning = false;
-      this.intentionalStop = true;
-      this.emit("status");
-      this.notify(
-        `Erreur de connexion Steam : ${cause.summary}\nRelance \`/idle start\` pour réessayer.`,
-        "error",
-        "Connexion Steam perdue",
-      ).catch((err: unknown) =>
-        this.logger.warn({ err }, "Notification erreur Steam échouée"),
-      );
+      if (this.credentials.refreshToken) {
+        this.scheduleRestart();
+      } else {
+        this.phase = "error";
+        this.desiredRunning = false;
+        this.intentionalStop = true;
+        this.emit("status");
+        this.notify(
+          `Erreur de connexion Steam : ${cause.summary}\nRelance \`/idle start\` pour réessayer.`,
+          "error",
+          "Connexion Steam perdue",
+        ).catch((err: unknown) =>
+          this.logger.warn({ err }, "Notification erreur Steam échouée"),
+        );
+      }
     });
+  }
+
+  private scheduleRestart() {
+    if (!this.desiredRunning) {
+      this.phase = "stopped";
+      this.emit("status");
+      return;
+    }
+
+    this.reconnectAttempt += 1;
+    const delayMs = reconnectDelayMs(this.reconnectAttempt);
+    this.nextRestartAt = new Date(Date.now() + delayMs);
+    this.phase = "restarting";
+    this.emit("status");
+
+    if (this.reconnectAttempt === 1) {
+      this.notify(
+        `Connexion Steam perdue. Reconnexion automatique dans **${formatDuration(delayMs)}**.`,
+        "warn",
+        "Reconnexion automatique",
+      ).catch((err: unknown) =>
+        this.logger.warn({ err }, "Notification reconnexion échouée"),
+      );
+    }
+
+    this.clearRestartTimer();
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      this.startInternal("auto-restart").catch((error: unknown) => {
+        this.handleFatal("Auto-restart échoué", error);
+      });
+    }, delayMs);
   }
 
   private enterStandby(reason: string, playingApp: number | null) {
@@ -399,6 +487,13 @@ export class SteamIdleService extends EventEmitter {
 
   private isDryRun() {
     return this.config.dryRun;
+  }
+
+  private clearRestartTimer() {
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
   }
 
   private clearResumeTimer() {
@@ -442,23 +537,29 @@ export class SteamIdleService extends EventEmitter {
     const detail = error instanceof Error ? error.message : String(error);
     this.lastError = `${message} : ${detail}`;
     this.log("error", this.lastError);
-    this.phase = "error";
-    this.desiredRunning = false;
-    this.intentionalStop = true;
-    this.connected = false;
-    this.client?.logOff();
-    this.client = null;
-    this.emit("status");
-    this.notify(
-      `Erreur inattendue : ${this.lastError}\nRelance \`/idle start\`.`,
-      "error",
-      "Erreur Steam",
-    ).catch((err: unknown) =>
-      this.logger.warn({ err }, "Notification erreur fatale échouée"),
-    );
+
+    if (this.credentials.refreshToken) {
+      this.scheduleRestart();
+    } else {
+      this.phase = "error";
+      this.desiredRunning = false;
+      this.intentionalStop = true;
+      this.connected = false;
+      this.client?.logOff();
+      this.client = null;
+      this.emit("status");
+      this.notify(
+        `Erreur inattendue : ${this.lastError}\nRelance \`/idle start\`.`,
+        "error",
+        "Erreur Steam",
+      ).catch((err: unknown) =>
+        this.logger.warn({ err }, "Notification erreur fatale échouée"),
+      );
+    }
   }
 
   private stopForRealPlay(meta: unknown) {
+    this.clearRestartTimer();
     this.clearResumeTimer();
     this.desiredRunning = false;
     this.intentionalStop = true;
@@ -466,6 +567,9 @@ export class SteamIdleService extends EventEmitter {
     this.lastError = null;
     this.standbyReason = null;
     this.realPlayingAppId = null;
+    this.currentAppIds = [];
+    this.nextRestartAt = null;
+    this.reconnectAttempt = 0;
     this.emit("status");
 
     this.log("info", "Idle arrêté — jeu lancé pour de vrai", meta);
@@ -479,6 +583,7 @@ export class SteamIdleService extends EventEmitter {
   }
 
   private handleUnrecoverableSteamError(cause: ReturnType<typeof formatSteamLoginError>, meta?: unknown) {
+    this.clearRestartTimer();
     this.clearSteamGuardRequest();
     this.desiredRunning = false;
     this.intentionalStop = true;
@@ -487,6 +592,11 @@ export class SteamIdleService extends EventEmitter {
     this.lastError = cause.summary;
     this.client?.logOff();
     this.client = null;
+    // Token invalidé — le prochain login devra utiliser les credentials complets
+    this.credentials.refreshToken = null;
+    this.onRefreshToken(null).catch((err: unknown) =>
+      this.logger.warn({ err }, "Suppression refresh token échouée"),
+    );
     this.emit("status");
     this.log("error", cause.summary, meta);
     this.notify(formatUnrecoverableNotification(cause), "error", "Connexion impossible").catch(

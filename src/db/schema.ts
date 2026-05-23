@@ -34,6 +34,8 @@ export const userAccounts = pgTable(
     steamUsername: varchar("steam_username", { length: 100 }).notNull(),
     encryptedPassword: text("encrypted_password").notNull(),
     encryptionIv: varchar("encryption_iv", { length: 64 }).notNull(),
+    refreshToken: text("refresh_token"),
+    refreshTokenIv: varchar("refresh_token_iv", { length: 64 }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },

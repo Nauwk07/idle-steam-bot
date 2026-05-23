@@ -79,6 +79,9 @@ export const commandDefinitions = [
         .addBooleanOption((o) =>
           o.setName("active").setDescription("Mettre en pause.").setRequired(true),
         ),
+    )
+    .addSubcommand((sub) =>
+      sub.setName("stats").setDescription("Tes statistiques d'idle (sessions, historique)."),
     ),
 
   // ─── /game ────────────────────────────────────────────────────
@@ -106,6 +109,19 @@ export const commandDefinitions = [
     )
     .addSubcommand((sub) =>
       sub.setName("list").setDescription("Liste tes jeux."),
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("bulk")
+        .setDescription("Ajoute plusieurs jeux d'un coup.")
+        .addStringOption((o: SlashCommandStringOption) =>
+          o
+            .setName("appids")
+            .setDescription("AppIDs séparés par des espaces (ex: 440 570 730).")
+            .setRequired(true)
+            .setMinLength(1)
+            .setMaxLength(500),
+        ),
     )
     .addSubcommand((sub) =>
       sub

@@ -86,6 +86,14 @@ export class UserAccountRepository {
     }
   }
 
+  async updateRefreshToken(discordUserId: string, encryptedToken: string | null, iv: string | null) {
+    const db = getDb();
+    await db
+      .update(schema.userAccounts)
+      .set({ refreshToken: encryptedToken, refreshTokenIv: iv, updatedAt: new Date() })
+      .where(eq(schema.userAccounts.discordUserId, discordUserId));
+  }
+
   async delete(discordUserId: string) {
     const db = getDb();
     await db
@@ -188,6 +196,13 @@ export class UserGamesRepository {
 
 // ─── UserEventsRepository ─────────────────────────────────────
 
+export type UserStats = {
+  totalSessions: number;
+  totalEvents: number;
+  firstActivityAt: Date | null;
+  lastActivityAt: Date | null;
+};
+
 export class UserEventsRepository {
   async add(discordUserId: string, level: string, message: string, meta?: unknown) {
     const db = getDb();
@@ -217,6 +232,36 @@ export class UserEventsRepository {
       .delete(schema.userEvents)
       .where(lt(schema.userEvents.createdAt, cutoff));
     return result.rowCount ?? 0;
+  }
+
+  async stats(discordUserId: string): Promise<UserStats> {
+    const db = getDb();
+
+    const [agg] = await db
+      .select({
+        totalEvents: sql<number>`count(*)::int`,
+        firstAt: sql<Date | null>`min(${schema.userEvents.createdAt})`,
+        lastAt: sql<Date | null>`max(${schema.userEvents.createdAt})`,
+      })
+      .from(schema.userEvents)
+      .where(eq(schema.userEvents.discordUserId, discordUserId));
+
+    const [sessRow] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(schema.userEvents)
+      .where(
+        and(
+          eq(schema.userEvents.discordUserId, discordUserId),
+          eq(schema.userEvents.message, "Connecté à Steam"),
+        ),
+      );
+
+    return {
+      totalSessions: sessRow?.count ?? 0,
+      totalEvents: agg?.totalEvents ?? 0,
+      firstActivityAt: agg?.firstAt ?? null,
+      lastActivityAt: agg?.lastAt ?? null,
+    };
   }
 }
 
