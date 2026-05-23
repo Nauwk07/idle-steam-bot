@@ -6,17 +6,12 @@ import type { AppConfig } from "../config";
 import type { UserEventsRepository, UserGamesRepository } from "../db/repositories";
 import type { AppLogger } from "../logger";
 import type { Notifier } from "../services/notifier";
-import { RATE_LIMIT_BACKOFF_MS, reconnectDelayMs } from "./reconnectStrategy";
 import {
-  formatPlainError,
-  formatRateLimitNotification,
-  formatReconnectNotification,
   formatSteamDisconnect,
   formatSteamLoginError,
   formatUnrecoverableNotification,
   isRealSessionTakeover,
   isUnrecoverableLoginError,
-  type SteamErrorPresentation,
 } from "./steamErrors";
 
 export type IdlePhase =
@@ -24,7 +19,6 @@ export type IdlePhase =
   | "starting"
   | "running"
   | "standby"
-  | "restarting"
   | "error";
 
 export type IdleStatus = {
@@ -34,8 +28,6 @@ export type IdleStatus = {
   activeAppIds: number[];
   standbyReason: string | null;
   realPlayingAppId: number | null;
-  reconnectAttempt: number;
-  nextRestartAt: string | null;
   startedAt: string | null;
   lastError: string | null;
 };
@@ -60,11 +52,8 @@ export class SteamIdleService extends EventEmitter {
   private desiredRunning = false;
   private standbyReason: string | null = null;
   private realPlayingAppId: number | null = null;
-  private reconnectAttempt = 0;
-  private restartTimer: NodeJS.Timeout | null = null;
   private resumeTimer: NodeJS.Timeout | null = null;
   private pendingSteamGuard: SteamGuardRequest | null = null;
-  private nextRestartAt: Date | null = null;
   private startedAt: Date | null = null;
   private lastError: string | null = null;
   private intentionalStop = false;
@@ -90,8 +79,6 @@ export class SteamIdleService extends EventEmitter {
       activeAppIds: [],
       standbyReason: this.standbyReason,
       realPlayingAppId: this.realPlayingAppId,
-      reconnectAttempt: this.reconnectAttempt,
-      nextRestartAt: this.nextRestartAt?.toISOString() ?? null,
       startedAt: this.startedAt?.toISOString() ?? null,
       lastError: this.lastError,
     };
@@ -133,7 +120,6 @@ export class SteamIdleService extends EventEmitter {
   }
 
   private async startInternal(reason = "manual", steamGuardCode?: string) {
-    this.clearRestartTimer();
     this.desiredRunning = true;
     this.intentionalStop = false;
     this.standbyReason = null;
@@ -143,7 +129,6 @@ export class SteamIdleService extends EventEmitter {
       this.startedAt = new Date();
       this.connected = true;
       this.phase = "running";
-      this.reconnectAttempt = 0;
       const count = await this.games.countEnabled(this.discordUserId);
       this.log("info", "Idle dry-run démarré", { reason });
       this.emit("status");
@@ -179,10 +164,8 @@ export class SteamIdleService extends EventEmitter {
   private async stopInternal(reason = "manual") {
     this.desiredRunning = false;
     this.intentionalStop = true;
-    this.clearRestartTimer();
     this.clearResumeTimer();
     this.clearSteamGuardRequest();
-    this.nextRestartAt = null;
     this.standbyReason = null;
     this.realPlayingAppId = null;
 
@@ -252,8 +235,6 @@ export class SteamIdleService extends EventEmitter {
       this.connected = true;
       this.clearSteamGuardRequest();
       this.phase = "running";
-      this.reconnectAttempt = 0;
-      this.nextRestartAt = null;
       this.lastError = null;
       this.startedAt = new Date();
       client.setPersona(SteamUser.EPersonaState.Online);
@@ -327,8 +308,18 @@ export class SteamIdleService extends EventEmitter {
 
       const cause = formatSteamDisconnect(eresult, message);
       this.lastError = cause.summary;
+      this.phase = "error";
+      this.desiredRunning = false;
+      this.intentionalStop = true;
       this.log("warn", "Déconnexion Steam", { eresult, message, summary: cause.summary });
-      this.scheduleRestart(cause);
+      this.emit("status");
+      this.notify(
+        `Connexion Steam perdue : ${cause.summary}\nRelance \`/idle start\` quand les serveurs sont disponibles.`,
+        "error",
+        "Connexion Steam perdue",
+      ).catch((error: unknown) =>
+        this.logger.warn({ error }, "Notification déconnexion échouée"),
+      );
     });
 
     client.on("error", (error) => {
@@ -356,12 +347,17 @@ export class SteamIdleService extends EventEmitter {
         return;
       }
 
-      if (error.eresult === SteamUser.EResult.RateLimitExceeded) {
-        this.scheduleRateLimitBackoff(cause);
-        return;
-      }
-
-      this.scheduleRestart(cause);
+      this.phase = "error";
+      this.desiredRunning = false;
+      this.intentionalStop = true;
+      this.emit("status");
+      this.notify(
+        `Erreur de connexion Steam : ${cause.summary}\nRelance \`/idle start\` pour réessayer.`,
+        "error",
+        "Connexion Steam perdue",
+      ).catch((err: unknown) =>
+        this.logger.warn({ err }, "Notification erreur Steam échouée"),
+      );
     });
   }
 
@@ -397,71 +393,8 @@ export class SteamIdleService extends EventEmitter {
     }, this.config.steam.playScanIntervalMs);
   }
 
-  private scheduleRestart(cause: SteamErrorPresentation) {
-    if (!this.desiredRunning) {
-      this.phase = "stopped";
-      this.emit("status");
-      return;
-    }
-
-    this.phase = "restarting";
-    this.reconnectAttempt += 1;
-    const delayMs = reconnectDelayMs(this.reconnectAttempt);
-    this.nextRestartAt = new Date(Date.now() + delayMs);
-    this.lastError = cause.summary;
-    this.emit("status");
-
-    this.notify(
-      formatReconnectNotification(this.reconnectAttempt, delayMs, cause),
-      "warn",
-      "Connexion Steam perdue",
-    ).catch((error: unknown) =>
-      this.logger.warn({ error }, "Notification auto-restart échouée"),
-    );
-
-    this.clearRestartTimer();
-    this.restartTimer = setTimeout(() => {
-      this.restartTimer = null;
-      this.client = null;
-      this.connected = false;
-      this.startInternal("auto-restart").catch((error: unknown) => {
-        this.handleFatal("Auto-restart échoué", error);
-      });
-    }, delayMs);
-  }
-
-  private scheduleRateLimitBackoff(cause: SteamErrorPresentation) {
-    this.phase = "restarting";
-    this.reconnectAttempt += 1;
-    this.nextRestartAt = new Date(Date.now() + RATE_LIMIT_BACKOFF_MS);
-    this.lastError = cause.summary;
-    this.emit("status");
-
-    this.notify(formatRateLimitNotification(cause, RATE_LIMIT_BACKOFF_MS), "warn", "Limite Steam").catch(
-      (error: unknown) =>
-      this.logger.warn({ error }, "Notification rate-limit échouée"),
-    );
-
-    this.clearRestartTimer();
-    this.restartTimer = setTimeout(() => {
-      this.restartTimer = null;
-      this.client = null;
-      this.connected = false;
-      this.startInternal("rate-limit-backoff").catch((error: unknown) => {
-        this.handleFatal("Relance après rate-limit échouée", error);
-      });
-    }, RATE_LIMIT_BACKOFF_MS);
-  }
-
   private isDryRun() {
     return this.config.dryRun;
-  }
-
-  private clearRestartTimer() {
-    if (this.restartTimer) {
-      clearTimeout(this.restartTimer);
-      this.restartTimer = null;
-    }
   }
 
   private clearResumeTimer() {
@@ -503,14 +436,25 @@ export class SteamIdleService extends EventEmitter {
 
   private handleFatal(message: string, error: unknown) {
     const detail = error instanceof Error ? error.message : String(error);
-    const cause = formatPlainError(`${message} : ${detail}`);
-    this.lastError = cause.summary;
+    this.lastError = `${message} : ${detail}`;
     this.log("error", this.lastError);
-    this.scheduleRestart(cause);
+    this.phase = "error";
+    this.desiredRunning = false;
+    this.intentionalStop = true;
+    this.connected = false;
+    this.client?.logOff();
+    this.client = null;
+    this.emit("status");
+    this.notify(
+      `Erreur inattendue : ${this.lastError}\nRelance \`/idle start\`.`,
+      "error",
+      "Erreur Steam",
+    ).catch((err: unknown) =>
+      this.logger.warn({ err }, "Notification erreur fatale échouée"),
+    );
   }
 
   private stopForRealPlay(meta: unknown) {
-    this.clearRestartTimer();
     this.clearResumeTimer();
     this.desiredRunning = false;
     this.intentionalStop = true;
@@ -518,8 +462,6 @@ export class SteamIdleService extends EventEmitter {
     this.lastError = null;
     this.standbyReason = null;
     this.realPlayingAppId = null;
-    this.nextRestartAt = null;
-    this.reconnectAttempt = 0;
     this.emit("status");
 
     this.log("info", "Idle arrêté — jeu lancé pour de vrai", meta);
@@ -532,8 +474,7 @@ export class SteamIdleService extends EventEmitter {
     );
   }
 
-  private handleUnrecoverableSteamError(cause: SteamErrorPresentation, meta?: unknown) {
-    this.clearRestartTimer();
+  private handleUnrecoverableSteamError(cause: ReturnType<typeof formatSteamLoginError>, meta?: unknown) {
     this.clearSteamGuardRequest();
     this.desiredRunning = false;
     this.intentionalStop = true;

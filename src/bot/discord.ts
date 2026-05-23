@@ -37,7 +37,7 @@ import {
 import { SteamIdleService, type IdleStatus } from "../steam/steamIdleService";
 import { encrypt } from "../utils/encryption";
 import { brandedEmbed, type EmbedType } from "../utils/embeds";
-import { formatDuration, formatRelativeTimestamp } from "../utils/format";
+import { formatDuration } from "../utils/format";
 import { createBotLog, logCommand, type BotLog } from "../utils/log";
 import { commandDefinitions } from "./commands";
 import {
@@ -538,18 +538,6 @@ export class DiscordBot {
             ),
           ],
         });
-      } else if (result === "reconnecting") {
-        const lines = [
-          "La connexion a été coupée par Steam avant d'être stable.",
-          status.lastError ? `- **Cause** : ${status.lastError}` : null,
-          status.nextRestartAt
-            ? `- **Prochaine tentative** : ${formatRelativeTimestamp(status.nextRestartAt)}`
-            : "- **Reconnexion** : en cours…",
-          "- L'idle repartira tout seul. Suis avec `/idle status`.",
-        ].filter((line): line is string => line !== null);
-        await interaction.editReply({
-          embeds: [brandedEmbed(this.client, "warn", lines.join("\n"), "Connexion interrompue")],
-        });
       } else {
         const detail =
           status.lastError ??
@@ -578,19 +566,17 @@ export class DiscordBot {
   private waitForIdleResult(
     service: SteamIdleService,
     timeoutMs = 20_000,
-  ): Promise<"running" | "steam-guard" | "reconnecting" | "error"> {
-    const classify = (): "running" | "steam-guard" | "reconnecting" | "error" | null => {
+  ): Promise<"running" | "steam-guard" | "error"> {
+    const classify = (): "running" | "steam-guard" | "error" | null => {
       if (service.hasPendingSteamGuard()) return "steam-guard";
       const s = service.getStatus();
       if (s.phase === "running" || s.phase === "standby") return "running";
-      if (s.phase === "restarting") return "reconnecting";
       if (s.phase === "error") return "error";
       return null;
     };
 
-    const resolveOnTimeout = (): "running" | "steam-guard" | "reconnecting" | "error" => {
+    const resolveOnTimeout = (): "running" | "steam-guard" | "error" => {
       const s = service.getStatus();
-      if (s.phase === "restarting") return "reconnecting";
       if (s.phase === "running" || s.phase === "standby") return "running";
       if (service.hasPendingSteamGuard()) return "steam-guard";
       return "error";
@@ -600,7 +586,7 @@ export class DiscordBot {
     if (immediate) return Promise.resolve(immediate);
 
     return new Promise((resolve) => {
-      const finish = (result: "running" | "steam-guard" | "reconnecting" | "error") => {
+      const finish = (result: "running" | "steam-guard" | "error") => {
         clearTimeout(timer);
         service.off("status", handler);
         resolve(result);
@@ -736,14 +722,8 @@ export class DiscordBot {
       const uptime = Date.now() - new Date(status.startedAt).getTime();
       if (uptime > 0) lines.push(`- **Uptime** : ${formatDuration(uptime)}`);
     }
-    if (status.nextRestartAt && status.phase === "restarting") {
-      lines.push(`- **Prochain restart** : ${formatRelativeTimestamp(status.nextRestartAt)}`);
-    }
     if (status.standbyReason) lines.push(`- **Standby** : ${status.standbyReason}`);
-    if (status.lastError) {
-      const errLabel = status.phase === "restarting" ? "Dernière erreur" : "Erreur";
-      lines.push(`- **${errLabel}** : ${status.lastError}`);
-    }
+    if (status.lastError) lines.push(`- **Erreur** : ${status.lastError}`);
 
     return lines.join("\n");
   }
@@ -831,7 +811,6 @@ function translatePhase(phase: IdleStatus["phase"]) {
     starting: "démarrage",
     running: "actif",
     standby: "standby",
-    restarting: "relance en cours",
     error: "erreur",
   };
   return labels[phase];
