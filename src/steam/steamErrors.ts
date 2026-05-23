@@ -1,7 +1,5 @@
 import SteamUser from "steam-user";
 
-import { formatDuration } from "../utils/format";
-
 export type SteamErrorPresentation = {
   /** Ligne courte pour logs, lastError, embed status */
   summary: string;
@@ -34,12 +32,12 @@ const KNOWN_ERRORS: Partial<Record<number, KnownError>> = {
   [SteamUser.EResult.TryAnotherCM]: {
     summary: "Serveur Steam saturé",
     detail: "Le serveur de connexion actuel est surchargé.",
-    hint: "Une reconnexion automatique va tenter un autre serveur.",
+    hint: "Relance `/idle start` dans quelques instants — un autre serveur sera tenté.",
   },
   [SteamUser.EResult.RateLimitExceeded]: {
     summary: "Trop de tentatives de connexion",
     detail: "Steam limite temporairement les logins.",
-    hint: "Attends avant de relancer — le bot fera une pause automatique.",
+    hint: "Attends quelques minutes avant de relancer `/idle start`.",
   },
   [SteamUser.EResult.AccountLogonDenied]: {
     summary: "Connexion refusée par Steam",
@@ -111,7 +109,6 @@ export function formatSteamDisconnect(
     body: [
       "**Connexion Steam interrompue**",
       `Steam a fermé la session${codeSuffix}.`,
-      "_Le bot va réessayer automatiquement._",
     ].join("\n"),
   };
 }
@@ -132,42 +129,11 @@ export function formatSteamLoginError(
   };
 }
 
-export function formatPlainError(message: string): SteamErrorPresentation {
-  const trimmed = message.trim();
-  return {
-    summary: trimmed.length > 120 ? `${trimmed.slice(0, 117)}…` : trimmed,
-    body: trimmed,
-  };
-}
-
-export function formatReconnectNotification(
-  attempt: number,
-  delayMs: number,
-  cause: SteamErrorPresentation,
-): string {
-  const delay = formatDuration(delayMs);
-  return [
-    cause.body,
-    "",
-    `**Reconnexion automatique** — tentative **${attempt}** dans **${delay}**.`,
-    "_Suis l'état avec `/idle status`, ou `/idle stop` pour arrêter._",
-  ].join("\n");
-}
-
-export function formatRateLimitNotification(cause: SteamErrorPresentation, pauseMs: number): string {
-  return [
-    cause.body,
-    "",
-    `**Pause imposée par Steam** — nouvelle tentative dans **${formatDuration(pauseMs)}**.`,
-    "_Évite de spammer `/idle start` pendant cette période._",
-  ].join("\n");
-}
-
 export function formatUnrecoverableNotification(cause: SteamErrorPresentation): string {
   return [
     cause.body,
     "",
-    "**Reconnexion automatique désactivée** pour cette erreur.",
+    "L'idle a été arrêté — erreur non récupérable.",
     "Corrige le problème puis relance `/idle start`.",
   ].join("\n");
 }

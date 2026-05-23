@@ -52,6 +52,7 @@ export class SteamIdleService extends EventEmitter {
   private desiredRunning = false;
   private standbyReason: string | null = null;
   private realPlayingAppId: number | null = null;
+  private currentAppIds: number[] = [];
   private resumeTimer: NodeJS.Timeout | null = null;
   private pendingSteamGuard: SteamGuardRequest | null = null;
   private startedAt: Date | null = null;
@@ -76,7 +77,7 @@ export class SteamIdleService extends EventEmitter {
       phase: this.phase,
       connected: this.connected,
       desiredRunning: this.desiredRunning,
-      activeAppIds: [],
+      activeAppIds: [...this.currentAppIds],
       standbyReason: this.standbyReason,
       realPlayingAppId: this.realPlayingAppId,
       startedAt: this.startedAt?.toISOString() ?? null,
@@ -168,6 +169,7 @@ export class SteamIdleService extends EventEmitter {
     this.clearSteamGuardRequest();
     this.standbyReason = null;
     this.realPlayingAppId = null;
+    this.currentAppIds = [];
 
     if (this.client && this.connected) {
       this.client.gamesPlayed([]);
@@ -196,6 +198,7 @@ export class SteamIdleService extends EventEmitter {
 
     const appIds = await this.games.enabledAppIds(this.discordUserId);
     this.client.gamesPlayed(appIds, false);
+    this.currentAppIds = appIds;
     this.log("info", "Liste de jeux appliquée", { reason, appIds });
     this.emit("status");
   }
@@ -370,6 +373,7 @@ export class SteamIdleService extends EventEmitter {
       this.client.gamesPlayed([]);
     }
 
+    this.currentAppIds = [];
     this.log("warn", "Idle en standby", { reason, playingApp });
     this.scheduleResumeProbe();
     this.emit("status");
@@ -492,7 +496,9 @@ export class SteamIdleService extends EventEmitter {
   }
 
   private log(level: "info" | "warn" | "error", message: string, meta?: unknown) {
-    this.events.add(this.discordUserId, level, message, meta).catch(() => {});
+    this.events.add(this.discordUserId, level, message, meta).catch((err: unknown) => {
+      this.logger.warn({ err, discordUserId: this.discordUserId }, "Échec enregistrement événement");
+    });
     this.logger[level]({ discordUserId: this.discordUserId, meta }, message);
   }
 

@@ -10,6 +10,7 @@ import {
 } from "./db/repositories";
 import { createLogger } from "./logger";
 import { LogChannelService } from "./services/logChannel";
+import { getSteamAppName } from "./services/steamStore";
 import { UserIdleManager } from "./services/userIdleManager";
 
 const config = loadConfig();
@@ -43,6 +44,37 @@ async function shutdown(signal: string, idleManager: UserIdleManager) {
   process.exit(0);
 }
 
+const RETENTION_DAYS = 90;
+
+async function backfillGameNames(games: UserGamesRepository) {
+  try {
+    const unnamed = await games.listWithoutName();
+    if (unnamed.length === 0) return;
+    logger.info({ count: unnamed.length }, "Backfill noms de jeux");
+    for (const { discordUserId, appId } of unnamed) {
+      const name = await getSteamAppName(appId);
+      if (name) await games.updateName(discordUserId, appId, name);
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  } catch (err) {
+    logger.warn({ err }, "Erreur backfill noms de jeux");
+  }
+}
+
+async function runRetentionCleanup(events: UserEventsRepository, audit: AuditRepository) {
+  try {
+    const [eventsDeleted, auditDeleted] = await Promise.all([
+      events.deleteOlderThan(RETENTION_DAYS),
+      audit.deleteOlderThan(RETENTION_DAYS),
+    ]);
+    if (eventsDeleted > 0 || auditDeleted > 0) {
+      logger.info({ eventsDeleted, auditDeleted, days: RETENTION_DAYS }, "Nettoyage données anciennes");
+    }
+  } catch (err) {
+    logger.warn({ err }, "Erreur nettoyage rétention");
+  }
+}
+
 async function main() {
   initDatabase(config.databaseUrl);
   logger.info("Base de données connectée");
@@ -52,6 +84,9 @@ async function main() {
   const events = new UserEventsRepository();
   const audit = new AuditRepository();
   const guildConfig = new GuildConfigRepository();
+
+  void runRetentionCleanup(events, audit);
+  void backfillGameNames(games);
 
   const discordClient = createDiscordClient();
   const logChannel = new LogChannelService(discordClient, config.discord.guildId, guildConfig, logger);

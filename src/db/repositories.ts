@@ -1,4 +1,4 @@
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, lt, sql } from "drizzle-orm";
 import { getDb, schema } from "./index";
 import type {
   AuditEvent,
@@ -149,6 +149,27 @@ export class UserGamesRepository {
       });
   }
 
+  async listWithoutName(): Promise<{ discordUserId: string; appId: number }[]> {
+    const db = getDb();
+    return db
+      .select({ discordUserId: schema.userGames.discordUserId, appId: schema.userGames.appId })
+      .from(schema.userGames)
+      .where(isNull(schema.userGames.name));
+  }
+
+  async updateName(discordUserId: string, appId: number, name: string) {
+    const db = getDb();
+    await db
+      .update(schema.userGames)
+      .set({ name, updatedAt: new Date() })
+      .where(
+        and(
+          eq(schema.userGames.discordUserId, discordUserId),
+          eq(schema.userGames.appId, appId),
+        ),
+      );
+  }
+
   async remove(discordUserId: string, appId: number) {
     const db = getDb();
     const result = await db
@@ -187,6 +208,15 @@ export class UserEventsRepository {
       .where(eq(schema.userEvents.discordUserId, discordUserId))
       .orderBy(desc(schema.userEvents.createdAt))
       .limit(Math.max(1, Math.min(limit, 50)));
+  }
+
+  async deleteOlderThan(days: number): Promise<number> {
+    const db = getDb();
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const result = await db
+      .delete(schema.userEvents)
+      .where(lt(schema.userEvents.createdAt, cutoff));
+    return result.rowCount ?? 0;
   }
 }
 
@@ -234,5 +264,14 @@ export class AuditRepository {
       ? base.where(eq(schema.auditEvents.discordUserId, filterUserId))
       : base;
     return query.orderBy(desc(schema.auditEvents.createdAt)).limit(clamped);
+  }
+
+  async deleteOlderThan(days: number): Promise<number> {
+    const db = getDb();
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const result = await db
+      .delete(schema.auditEvents)
+      .where(lt(schema.auditEvents.createdAt, cutoff));
+    return result.rowCount ?? 0;
   }
 }

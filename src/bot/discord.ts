@@ -50,6 +50,9 @@ import {
 const MODAL_STEAM_GUARD_PREFIX = "steamguard";
 const MODAL_ACCOUNT_SETUP_ID = "account_setup";
 const INPUT_SG_CODE = "steamguard_code";
+const GAMES_PER_PAGE = 10;
+const GAME_LIST_BTN_PREV = "game:list:prev";
+const GAME_LIST_BTN_NEXT = "game:list:next";
 const INPUT_STEAM_USERNAME = "steam_username";
 const INPUT_STEAM_PASSWORD = "steam_password";
 
@@ -654,14 +657,67 @@ export class DiscordBot {
 
   private async gameList(interaction: ChatInputCommandInteraction) {
     const userGames = await this.games.list(interaction.user.id, true);
-    const text = userGames.length === 0
-      ? "Aucun jeu configuré.\n- Utilise `/game add appid:<id>` pour en ajouter un."
-      : [
-          `- **Total** : \`${userGames.length}\``,
-          "",
-          ...userGames.map((g) => `- **${g.name ?? "Inconnu"}** — \`${g.appId}\` ${g.enabled ? "" : "_(désactivé)_"}`),
-        ].join("\n");
-    await this.replyEphemeral(interaction, "info", "Tes jeux", text);
+
+    if (userGames.length === 0) {
+      await this.replyEphemeral(
+        interaction,
+        "info",
+        "Tes jeux",
+        "Aucun jeu configuré.\n- Utilise `/game add appid:<id>` pour en ajouter un.",
+      );
+      return;
+    }
+
+    const totalPages = Math.ceil(userGames.length / GAMES_PER_PAGE);
+
+    if (totalPages === 1) {
+      await this.replyEphemeral(interaction, "info", "Tes jeux", buildGamePage(userGames, 0));
+      return;
+    }
+
+    let page = 0;
+
+    const buildRow = (p: number) =>
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(GAME_LIST_BTN_PREV)
+          .setLabel("◀ Précédent")
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(p === 0),
+        new ButtonBuilder()
+          .setCustomId(GAME_LIST_BTN_NEXT)
+          .setLabel("Suivant ▶")
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(p === totalPages - 1),
+      );
+
+    const reply = await interaction.reply({
+      embeds: [brandedEmbed(this.client, "info", buildGamePage(userGames, page), "Tes jeux")],
+      components: [buildRow(page)],
+      flags: MessageFlags.Ephemeral,
+      withResponse: true,
+    });
+
+    const collector = reply.resource!.message!.createMessageComponentCollector({
+      componentType: ComponentType.Button,
+      filter: (btn: ButtonInteraction) => btn.user.id === interaction.user.id,
+      time: 5 * 60 * 1000,
+    });
+
+    collector.on("collect", async (btn: ButtonInteraction) => {
+      page = btn.customId === GAME_LIST_BTN_PREV ? page - 1 : page + 1;
+      page = Math.max(0, Math.min(page, totalPages - 1));
+      await btn.update({
+        embeds: [brandedEmbed(this.client, "info", buildGamePage(userGames, page), "Tes jeux")],
+        components: [buildRow(page)],
+      });
+    });
+
+    collector.on("end", async () => {
+      try {
+        await interaction.editReply({ components: [] });
+      } catch { /* message supprimé */ }
+    });
   }
 
   private async gameSearch(interaction: ChatInputCommandInteraction) {
@@ -794,6 +850,20 @@ export class DiscordBot {
 }
 
 // ─── Formatters ──────────────────────────────────────────────
+
+function buildGamePage(
+  games: { name: string | null; appId: number; enabled: boolean }[],
+  page: number,
+): string {
+  const total = games.length;
+  const totalPages = Math.ceil(total / GAMES_PER_PAGE);
+  const slice = games.slice(page * GAMES_PER_PAGE, (page + 1) * GAMES_PER_PAGE);
+  return [
+    `- **Total** : \`${total}\` jeux — page **${page + 1}/${totalPages}**`,
+    "",
+    ...slice.map((g) => `- **${g.name ?? "Inconnu"}** — \`${g.appId}\`${g.enabled ? "" : " _(désactivé)_"}`),
+  ].join("\n");
+}
 
 function formatSearchResults(query: string, results: SteamSearchResult[]) {
   if (results.length === 0) return `Aucun résultat Steam pour **${query}**.`;
