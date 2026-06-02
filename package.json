@@ -7,11 +7,8 @@
     "build": "tsc -p tsconfig.json",
     "dev": "NODE_OPTIONS=--disable-warning=ExperimentalWarning tsx watch src/index.ts",
     "start": "NODE_OPTIONS=--disable-warning=ExperimentalWarning node dist/index.js",
-    "docker:prod": "docker compose up -d --build",
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
-    "docker:logs": "docker compose logs -f",
-    "docker:down": "docker compose down",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
